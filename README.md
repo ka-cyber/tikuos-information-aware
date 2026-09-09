@@ -159,10 +159,10 @@ are workload realizations, not independent observations within a workload.
 - explicit hint delay
 - controller cost
 
-The scientific target is not â€œalways winâ€. It is the boundary:
+The scientific target is not always win. It is the boundary:
 
 ```text
-utility-estimation quality Ã— controller overhead
+utility-estimation quality x controller overhead
                 â†“
         positive / neutral / harmful
 ```
