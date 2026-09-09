@@ -106,7 +106,7 @@ outcome.
 - Neither application is linked into the TikuOS kernel.
 
 These adapters are **application-grounding mechanisms**, not evidence of a
-full hardware CardioFusionâ†’TikuOSâ†’APC-RLNC deployment.
+full hardware CardioFusion -> TikuOS -> APC-RLNC deployment.
 
 ## Primary endpoint
 
