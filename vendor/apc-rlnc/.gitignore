@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.so
+*.egg-info/
+build/
+.venv/
+venv/
+*.csv
+!docs/reference_results/*.csv
+.pytest_cache/
+
+# Go
+testbed/clustering-go/apc-cluster-daemon
+
+# C++
+testbed/rlnc-cpp/build/
+testbed/rlnc-cpp/rlnc_demo
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,312 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_crt_early.c - Apollo510 (Cortex-M55) startup.
+ *
+ * There is no boot2 or image header: the on-silicon secure bootloader jumps
+ * straight to the vector table in MRAM.  Reset masks IRQs, sets SP and VTOR,
+ * enables the FPU, copies .data, zeroes .bss, powers the EPU, then calls main.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdint.h>
+#include "apollo510.h"   /* PWRCTRL (shared-SRAM power-enable) */
+
+/**
+ * @brief FP/MVE (EPU) behaviour on low-power entry -- PWRMODCTL ELPSTATE[5:4].
+ *
+ * 1 = ON with the clock stopped (the CMSIS SystemInit choice: no power-up stall
+ *     on wake, best continuous FP/MVE throughput)
+ * 2 = retained (state kept, unit powered down) -- the DEFAULT here
+ *
+ * @note 3 (OFF) is rejected below; see the rationale at the write site.
+ */
+#ifndef TIKU_AMBIQ_ELP_STATE
+#define TIKU_AMBIQ_ELP_STATE 2u
+#endif
+_Static_assert(TIKU_AMBIQ_ELP_STATE <= 2u,
+               "TIKU_AMBIQ_ELP_STATE=3 (EPU OFF) discards FP/MVE register state "
+               "and this build is hard-float -- it boot-loops the board");
+
+/*---------------------------------------------------------------------------*/
+/* Linker-script symbols                                                     */
+/*---------------------------------------------------------------------------*/
+
+extern uint32_t __data_load;
+extern uint32_t __data_start;
+extern uint32_t __data_end;
+extern uint32_t __bss_start;
+extern uint32_t __bss_end;
+extern uint32_t __ssram_start;
+extern uint32_t __ssram_end;
+extern uint32_t __stack;
+
+/*---------------------------------------------------------------------------*/
+/* External entry points                                                     */
+/*---------------------------------------------------------------------------*/
+
+extern int  main(void);
+
+/* Forward decl of the vector table (defined below). Apollo510 has 135
+ * external IRQs (0..134, see AmbiqSuite startup_gcc.c). */
+typedef void (*ambiq_isr_t)(void);
+#define AMBIQ_NUM_EXT_IRQS  135
+extern const ambiq_isr_t tiku_ambiq_vectors[16 + AMBIQ_NUM_EXT_IRQS];
+
+/*---------------------------------------------------------------------------*/
+/* Default + weak handlers (override with a same-named non-weak symbol)       */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Default (catch-all) exception and IRQ handler
+ *
+ * Spins on WFE so a debugger halt lands on something recognisable rather than
+ * hard-faulting into an unknown location.  Every vector slot tikuOS has not
+ * claimed aliases here weakly; override with a non-weak named handler.
+ */
+static void ambiq_default_handler(void) {
+    while (1) {
+        __asm__ volatile ("wfe");
+    }
+}
+
+/** @brief NMI handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_nmi_handler(void)          __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief HardFault handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_hard_fault_handler(void)   __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief MemManage fault handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_mem_fault_handler(void)    __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief BusFault handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_bus_fault_handler(void)    __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief UsageFault handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_usage_fault_handler(void)  __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief SecureFault (ARMv8-M) handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_secure_fault_handler(void) __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief SVC handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_svc_handler(void)          __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief PendSV handler — weak alias to ambiq_default_handler */
+void tiku_ambiq_pendsv_handler(void)       __attribute__((weak, alias("ambiq_default_handler")));
+
+/** @brief SysTick handler — weak; tiku_timer_arch.c provides the real one */
+void tiku_ambiq_systick_handler(void)      __attribute__((weak, alias("ambiq_default_handler")));
+
+/**
+ * @brief UART0 ISR — weak alias to ambiq_default_handler
+ *
+ * Peripheral IRQs tikuOS drivers may claim later (UART console, STIMER /
+ * TIMER for the htimer, GPIO0 for edge IRQs). The arch driver that handles
+ * each one provides a strong definition of the same symbol.
+ */
+void tiku_ambiq_uart0_isr(void)            __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief STIMER Compare0 ISR (htimer source) — weak alias */
+void tiku_ambiq_stimer_cmpr0_isr(void)     __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief STIMER Compare1 ISR (kernel tick, IRQ 33) — weak alias */
+void tiku_ambiq_stimer_cmpr1_isr(void)     __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief GPIO N0 ISR (pins 0-31) — weak alias */
+void tiku_ambiq_gpio0_isr(void)            __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief TIMER0 ISR — weak alias */
+void tiku_ambiq_timer0_isr(void)           __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief GPU ISR (IRQ 28) — weak alias; tiku_gpu_arch.c provides the real one
+ *  when TIKU_DRV_GPU_ENABLE=1. The alias resolves to the same address as the
+ *  default handler, so flag-off images are byte-identical. */
+void tiku_ambiq_gpu_isr(void)              __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief USB device controller ISR — weak alias when TIKU_DRV_USB_ENABLE=0 */
+void tiku_ambiq_usb_isr(void)              __attribute__((weak, alias("ambiq_default_handler")));
+
+/*---------------------------------------------------------------------------*/
+/* Reset handler                                                             */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * Apollo510 (Cortex-M55) reset handler -- bare-metal startup entry.
+ *
+ * Executed immediately after the SBL transfers control.  Performs:
+ *   1. Mask maskable IRQs (CPSID i) -- prevents spurious interrupts
+ *      during kernel init before the scheduler queue is built.
+ *   2. Set SP from the __stack linker symbol -- robust to alternate entries.
+ *   3. Set VTOR to tiku_ambiq_vectors (1024-aligned at MRAM 0x410000).
+ *   4. Enable the FPU (CPACR CP10/CP11) -- required by -mfloat-abi=hard.
+ *   5. Set the M55 EPU (FP/MVE) sleep behaviour via PWRMODCTL.CPDLPSTATE
+ *      ELPSTATE[5:4] -- see TIKU_AMBIQ_ELP_STATE below -- and enable
+ *      ARMv8.1-M LOB (SCB.CCR bit 19).
+ *   6. Power up the 3 MB shared SRAM (PWRCTRL.SSRAMPWREN, three groups)
+ *      with a bounded wait -- .ssram tier buffers live there.
+ *   7. Copy .data MRAM->DTCM, zero .bss, zero .ssram.
+ *   8. Call main(); hang on WFE if main() returns.
+ *
+ * Fully bare-metal: no AmbiqSuite dependency, and CMSIS SystemInit() is not
+ * called because its work is done inline above.
+ */
+void tiku_ambiq_reset_handler(void) __attribute__((naked, section(".text"), used));
+
+void tiku_ambiq_reset_handler(void) {
+    /* Mask maskable IRQs immediately. Cortex-M resets with PRIMASK = 0;
+     * something that programs an IRQ source during kernel init (e.g.
+     * SysTick.TICKINT in tiku_clock_arch_init()) would otherwise fire
+     * before tiku_sched_init() builds the process queue. IRQs are
+     * re-enabled at the end of tiku_cpu_full_init() (boot/tiku_boot.c),
+     * so scheduler-less builds (tests, benches, the power autorun) get a
+     * live tick too -- not only builds that reach tiku_sched_loop(). */
+    __asm__ volatile ("cpsid i" ::: "memory");
+
+    /* The SBL loads SP from vector[0], but set it explicitly so this
+     * handler is robust to alternate entry paths. */
+    __asm__ volatile ("ldr sp, =__stack");
+
+    /* Point VTOR at this table (the table address is 1024-aligned because
+     * it sits at MRAM origin 0x410000). */
+    *(volatile uint32_t *)0xE000ED08U = (uint32_t)tiku_ambiq_vectors;
+
+    /* Enable the FPU: CPACR grants full access to CP10/CP11. Required
+     * because the build uses -mfloat-abi=hard and libam_hal is built the
+     * same way. */
+    *(volatile uint32_t *)0xE000ED88U |= (0xFU << 20);
+
+    /* EPU (FP/MVE) sleep behaviour + the ARMv8.1-M Low-Overhead-Branch
+     * extension (SCB.CCR.LOB, used by -mcpu=cortex-m55 loop instructions).
+     * These are the two functional bits CMSIS SystemInit() sets that the steps
+     * above do not.
+     *
+     * ELPSTATE decides what happens to the FP/MVE unit when the core enters a
+     * low-power state.  CMSIS defaults to 0b01 (ON, clock stopped) for best
+     * FP/MVE performance -- no power-up stall on wake.  MEASURED on this board
+     * (Joulescope at J4, buck+tidied, n=4, SD 0.2-0.8 uA):
+     *
+     *     ELPSTATE=0b01 (ON, clk off)      idle 3.336 mA
+     *     ELPSTATE=0b10 (RET, state kept)  idle 2.398 mA   -937 uA = -28 %
+     *
+     * ...for +3.1 % on continuous MVE work (`dot` 1032 -> 1064 milli-cycles per
+     * element), with the saving already net of the 128 Hz tick's wake-ups and
+     * every kernel bit-exact afterwards.  For a duty-cycled OS that is the
+     * right trade, so RET is the default here; a compute-bound image can ask
+     * for the CMSIS choice with -DTIKU_AMBIQ_ELP_STATE=1.
+     *
+     * 0b11 (OFF) is NOT selectable: it discards FP/MVE register state on every
+     * low-power entry, and this build is hard-float, so the kernel holds live
+     * floating-point context across sleeps.  Selecting it once corrupted a
+     * calculation mid-flight and left the board in a crash-restart loop that
+     * needed a physical power cycle (2026-07-28).  The _Static_assert below
+     * refuses it at build time; `power cpdlp elp 3` refuses it at run time. */
+    {
+        volatile uint32_t *cpdlpstate = (volatile uint32_t *)0xE001E300U; /* PWRMODCTL */
+        *cpdlpstate = (*cpdlpstate & ~(0x3U << 4)) |
+                      ((uint32_t)TIKU_AMBIQ_ELP_STATE << 4);
+    }
+    *(volatile uint32_t *)0xE000ED14U |= (1U << 19);   /* SCB->CCR, LOB */
+    __asm__ volatile ("dsb");
+    __asm__ volatile ("isb");
+
+    /* Power up the 3 MB shared SRAM (three 1 MB groups). The SBL leaves it
+     * off; the large volatile tier buffers (.ssram) live there. Bounded wait so
+     * a stuck power FSM can't hang the boot. The cache is still off here, so
+     * this and the later .ssram zero-init reach the SSRAM directly. */
+    PWRCTRL->SSRAMPWREN_b.PWRENSSRAM = 0x7u;
+    {
+        uint32_t guard = 1000000u;
+        while ((PWRCTRL->SSRAMPWRST_b.SSRAMPWRST != 0x7u) && --guard) {
+        }
+    }
+
+    /* Copy .data from its MRAM load address to DTCM. */
+    uint32_t *src = &__data_load;
+    uint32_t *dst = &__data_start;
+    while (dst < &__data_end) {
+        *dst++ = *src++;
+    }
+
+    /* Zero .bss. (.uninit is intentionally left untouched.) */
+    dst = &__bss_start;
+    while (dst < &__bss_end) {
+        *dst++ = 0U;
+    }
+
+    /* Zero the SSRAM-resident static buffers (.ssram). Separate loop because
+     * they live in the just-powered SSRAM bank, not in DTCM .bss. */
+    dst = &__ssram_start;
+    while (dst < &__ssram_end) {
+        *dst++ = 0U;
+    }
+
+    (void)main();
+
+    /* Should never return. */
+    while (1) {
+        __asm__ volatile ("wfe");
+    }
+}
+
+/*---------------------------------------------------------------------------*/
+/* Vector table                                                              */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Apollo510 interrupt vector table
+ *
+ * 16 system exceptions + 135 external IRQs = 151 entries, placed in .vectors at
+ * MRAM origin (0x410000), which satisfies the M55 VTOR 1024-byte alignment.
+ * Peripheral slots default to ambiq_default_handler.
+ *
+ * @note The four named driver slots point at weak symbols that the arch drivers
+ *       override with strong definitions.
+ */
+const ambiq_isr_t tiku_ambiq_vectors[16 + AMBIQ_NUM_EXT_IRQS]
+__attribute__((section(".vectors"), used)) = {
+    /* System exceptions ------------------------------------------------ */
+    (ambiq_isr_t)(&__stack),            /*  0  Initial SP        */
+    tiku_ambiq_reset_handler,           /*  1  Reset             */
+    tiku_ambiq_nmi_handler,             /*  2  NMI               */
+    tiku_ambiq_hard_fault_handler,      /*  3  HardFault         */
+    tiku_ambiq_mem_fault_handler,       /*  4  MemManage         */
+    tiku_ambiq_bus_fault_handler,       /*  5  BusFault          */
+    tiku_ambiq_usage_fault_handler,     /*  6  UsageFault        */
+    tiku_ambiq_secure_fault_handler,    /*  7  SecureFault (v8M) */
+    ambiq_default_handler,              /*  8  Reserved          */
+    ambiq_default_handler,              /*  9  Reserved          */
+    ambiq_default_handler,              /* 10  Reserved          */
+    tiku_ambiq_svc_handler,             /* 11  SVC               */
+    ambiq_default_handler,              /* 12  DebugMon          */
+    ambiq_default_handler,              /* 13  Reserved          */
+    tiku_ambiq_pendsv_handler,          /* 14  PendSV            */
+    tiku_ambiq_systick_handler,         /* 15  SysTick           */
+
+    /* External interrupts (AmbiqSuite startup_gcc.c numbering) --------- */
+    /* Console UART: UART0 (IRQ 15) on the base Apollo510 EVB, or UART1 (IRQ 16)
+     * on the Apollo510 Blue EVB (apollo510b) -- gated on TIKU_CONSOLE_UART1. */
+#if defined(TIKU_CONSOLE_UART1)
+    [16 + 16] = tiku_ambiq_uart0_isr,        /* IRQ 16  UART1 (Blue EVB) */
+#else
+    [16 + 15] = tiku_ambiq_uart0_isr,        /* IRQ 15  UART0            */
+#endif
+    [16 + 27] = tiku_ambiq_usb_isr,          /* IRQ 27  USB0 device      */
+    [16 + 28] = tiku_ambiq_gpu_isr,          /* IRQ 28  GPU (Nema)       */
+    [16 + 32] = tiku_ambiq_stimer_cmpr0_isr, /* IRQ 32  STIMER Compare0  */
+    [16 + 33] = tiku_ambiq_stimer_cmpr1_isr, /* IRQ 33  STIMER Compare1 (tick) */
+    [16 + 56] = tiku_ambiq_gpio0_isr,        /* IRQ 56  GPIO N0 pins0-31 */
+    [16 + 67] = tiku_ambiq_timer0_isr,       /* IRQ 67  TIMER0           */
+
+    /* Everything else spins in the default handler (NULL would hard-fault
+     * if dispatched). Ranges chosen to skip the named slots above -- the
+     * console UART (slot moves with TIKU_CONSOLE_UART1: IRQ 16 on the Blue EVB,
+     * IRQ 15 otherwise) and the GPU (IRQ 28). The ranges MUST skip every named
+     * slot, or (being later initializers) they would clobber it. The GPU slot
+     * is unconditional: when TIKU_DRV_GPU_ENABLE is off, tiku_ambiq_gpu_isr is
+     * a weak alias of ambiq_default_handler, so the resolved address at slot 28
+     * is identical to the range default -- the flag-off image is byte-stable. */
+#if defined(TIKU_CONSOLE_UART1)
+    [16 +  0 ... 16 + 15] = ambiq_default_handler,   /* skip IRQ 16 (UART1) */
+    [16 + 17 ... 16 + 26] = ambiq_default_handler,   /* skip IRQ 27 (USB0)  */
+    [16 + 29 ... 16 + 31] = ambiq_default_handler,   /* skip IRQ 28 (GPU)   */
+#else
+    [16 +  0 ... 16 + 14] = ambiq_default_handler,   /* skip IRQ 15 (UART0) */
+    [16 + 16 ... 16 + 26] = ambiq_default_handler,   /* skip IRQ 27 (USB0)  */
+    [16 + 29 ... 16 + 31] = ambiq_default_handler,   /* skip IRQ 28 (GPU)   */
+#endif
+    [16 + 34 ... 16 + 55] = ambiq_default_handler,
+    [16 + 57 ... 16 + 66] = ambiq_default_handler,
+    [16 + 68 ... 16 + 134] = ambiq_default_handler,
+};

@@ -1,0 +1,288 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_adc_arch.c - nRF54L SAADC one-shot single-ended driver.
+ *
+ * Every conversion returns through EasyDMA into a static word-aligned RAM buffer,
+ * so the sequence is START/STARTED, then SAMPLE/END.  The reference is the 0.9 V
+ * band-gap at 1/4 gain; TIKU_ADC_CH_TEMP errors, since die temp is not a SAADC input.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <arch/nordic/tiku_adc_arch.h>
+#include <arch/nordic/tiku_device_select.h>   /* NRF_SAADC_S + SAADC_* fields */
+#include <arch/nordic/tiku_nordic_core.h>     /* tiku_nordic_dsb() barrier   */
+
+/*---------------------------------------------------------------------------*/
+/* Configuration                                                             */
+/*---------------------------------------------------------------------------*/
+
+/** @brief Secure alias of the single SAADC instance (All-Secure device). */
+#define TIKU_SAADC              NRF_SAADC_S
+
+/*
+ * Acquisition / conversion time codes (the nrfx defaults for nRF54L).
+ *
+ * TACQ = 79  -> (79 + 1) * 125 ns = 10 us acquisition; long enough for the
+ *               moderate source impedance of a resistor divider without a
+ *               dedicated buffer amplifier.
+ * TCONV = 7  -> (7 + 1) * 250 ns = 2 us conversion.
+ */
+#define TIKU_SAADC_TACQ         79UL
+#define TIKU_SAADC_TCONV        7UL
+
+/**
+ * @brief CH[0].CONFIG for a single-ended read.
+ *
+ * Internal 0.9 V reference, gain 1/4 (Gain2_8) -> 3.6 V full scale, normal
+ * (non-burst) single-ended mode, with the acquisition/conversion times above.
+ */
+#define TIKU_SAADC_CH_CONFIG                                                  \
+    ((SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos)         \
+     | (SAADC_CH_CONFIG_GAIN_Gain2_8  << SAADC_CH_CONFIG_GAIN_Pos)           \
+     | (TIKU_SAADC_TACQ               << SAADC_CH_CONFIG_TACQ_Pos)           \
+     | (TIKU_SAADC_TCONV              << SAADC_CH_CONFIG_TCONV_Pos)          \
+     | (SAADC_CH_CONFIG_MODE_SE       << SAADC_CH_CONFIG_MODE_Pos))
+
+/** @brief Bounded spin so a wedged conversion surfaces as ERR_TIMEOUT. */
+#define TIKU_SAADC_SPIN_MAX     100000UL
+
+/** @brief Physical GPIO port carrying every nRF54L15 analog input (P1). */
+#define TIKU_SAADC_AIN_PORT     1UL
+
+/** @brief EasyDMA MAXCNT for one 16-bit sample (byte count on nRF54L). */
+#define TIKU_SAADC_ONE_SAMPLE   2UL
+
+/*---------------------------------------------------------------------------*/
+/* State                                                                     */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief EasyDMA result buffer (one signed 16-bit sample).
+ *
+ * Must live in RAM and be word-aligned for the SAADC EasyDMA engine.
+ */
+static volatile int16_t tiku_saadc_result __attribute__((aligned(4)));
+
+/** @brief Non-zero once tiku_adc_arch_init() has enabled the SAADC. */
+static uint8_t tiku_saadc_ready;
+
+/**
+ * @brief GPIO pin index (on P1) for analog inputs AIN0..AIN7.
+ *
+ * nRF54L15 product-specification pin assignment; all analog inputs are on
+ * physical port P1, and the nRF54LM20A samples the same pins.
+ *
+ * @note Absolute scale (measured 2026-07-14): counts = VDD * (2/8) / 0.9V *
+ *       4096.  The L15-DK rail is 1.8 V -> `adc bat` ~2060; the LM20-DK ships
+ *       at ~3.0 V -> ~3450.  Cross-checked by driving P1.06 high on the LM20-DK:
+ *       3456 counts, byte-identical to the internal-VDD channel, so the board
+ *       difference is the PMIC rail setting, not an SAADC encoding delta.
+ */
+static const uint8_t tiku_saadc_ain_pin[8] = {
+    4u, 5u, 6u, 7u, 11u, 12u, 13u, 14u
+};
+
+/*---------------------------------------------------------------------------*/
+/* Helpers                                                                   */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Translate a kernel ADC channel ID into a CH[n].PSELP register value.
+ *
+ * External channels 0..7 select AIN0..AIN7 via the CONNECT=AnalogInput encoding;
+ * channel 31 (TIKU_ADC_CH_BATTERY) selects the internal VDD rail via
+ * CONNECT=Internal.  TIKU_ADC_CH_TEMP and any other ID have no SAADC input.
+ *
+ * @param channel  Kernel ADC channel ID.
+ * @return PSELP register value for a valid channel, or 0 (PSELP "not
+ *         connected", never a valid selection) for an unsupported channel.
+ */
+static uint32_t tiku_saadc_pselp(uint8_t channel)
+{
+    if (channel < 8u) {
+        return ((uint32_t)tiku_saadc_ain_pin[channel]
+                    << SAADC_CH_PSELP_PIN_Pos)
+             | (TIKU_SAADC_AIN_PORT << SAADC_CH_PSELP_PORT_Pos)
+             | (SAADC_CH_PSELP_CONNECT_AnalogInput
+                    << SAADC_CH_PSELP_CONNECT_Pos);
+    }
+    if (channel == TIKU_ADC_CH_BATTERY) {
+        return (SAADC_CH_PSELP_INTERNAL_Vdd << SAADC_CH_PSELP_INTERNAL_Pos)
+             | (SAADC_CH_PSELP_CONNECT_Internal
+                    << SAADC_CH_PSELP_CONNECT_Pos);
+    }
+    return 0u;
+}
+
+/**
+ * @brief Spin (bounded) until an SAADC event asserts.
+ *
+ * @param event  Address of the EVENTS_* register to poll.
+ * @return 0 once the event fires, -1 if it never does within the spin bound.
+ */
+static int tiku_saadc_wait(volatile uint32_t *event)
+{
+    uint32_t spin;
+
+    for (spin = 0u; spin < TIKU_SAADC_SPIN_MAX; spin++) {
+        if (*event != 0u) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/*---------------------------------------------------------------------------*/
+/* Public API                                                                */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Initialise and enable the SAADC.
+ *
+ * Decodes the requested resolution into RESOLUTION, then enables the converter.
+ * The nRF54L SAADC self-clocks -- no clock or power gate to open, unlike the
+ * RP2350 and Ambiq ports -- so ENABLE=1 is the only bring-up step.
+ *
+ * @note Offset auto-calibration is not run; it would trim a few LSB but is not
+ *       needed for a valid read.  The reference selector has no nRF54L
+ *       equivalent (fixed internal 0.9 V band-gap) and is accepted but ignored.
+ * @param config  ADC configuration; must be non-NULL with a known resolution.
+ * @return TIKU_ADC_OK on success, TIKU_ADC_ERR_PARAM for a NULL config or an
+ *         unrecognised resolution.
+ */
+int tiku_adc_arch_init(const tiku_adc_config_t *config)
+{
+    uint32_t res;
+
+    if (config == (const tiku_adc_config_t *)0) {
+        return TIKU_ADC_ERR_PARAM;
+    }
+
+    switch (config->resolution) {
+    case TIKU_ADC_RES_8BIT:  res = SAADC_RESOLUTION_VAL_8bit;  break;
+    case TIKU_ADC_RES_10BIT: res = SAADC_RESOLUTION_VAL_10bit; break;
+    case TIKU_ADC_RES_12BIT: res = SAADC_RESOLUTION_VAL_12bit; break;
+    default:
+        return TIKU_ADC_ERR_PARAM;
+    }
+
+    /* nRF54L has only the internal 0.9 V band-gap or an external reference
+     * pin; the interface's AVCC/1V2/2V0/2V5 selectors have no equivalent, so
+     * the request is accepted (API contract) but the fixed 0.9 V ref is used. */
+    (void)config->reference;
+
+    TIKU_SAADC->RESOLUTION = res;
+    TIKU_SAADC->ENABLE =
+        (SAADC_ENABLE_ENABLE_Enabled << SAADC_ENABLE_ENABLE_Pos);
+
+    tiku_saadc_ready = 1u;
+    return TIKU_ADC_OK;
+}
+
+/**
+ * @brief Disable the SAADC to save power.
+ */
+void tiku_adc_arch_close(void)
+{
+    TIKU_SAADC->ENABLE =
+        (SAADC_ENABLE_ENABLE_Disabled << SAADC_ENABLE_ENABLE_Pos);
+    tiku_saadc_ready = 0u;
+}
+
+/**
+ * @brief Validate that a channel maps to a real analog input.
+ *
+ * There is no pin mux to program: the SAADC connects the selected input through
+ * its own switch, and a GPIO's reset state (digital input buffer disconnected)
+ * is already the correct high-impedance analog configuration.
+ *
+ * @param channel  Kernel ADC channel ID.
+ * @return TIKU_ADC_OK for a supported channel, TIKU_ADC_ERR_PARAM otherwise.
+ */
+int tiku_adc_arch_channel_init(uint8_t channel)
+{
+    if (tiku_saadc_pselp(channel) == 0u) {
+        return TIKU_ADC_ERR_PARAM;
+    }
+    return TIKU_ADC_OK;
+}
+
+/**
+ * @brief Perform a one-shot single-ended conversion.
+ *
+ * Routes the channel onto CH[0], points EasyDMA at the static RAM sample buffer,
+ * runs the START/STARTED -> SAMPLE/END handshake, then stops the converter.
+ * Every wait is bounded and @p value is untouched on any failure.
+ *
+ * @param channel  Kernel ADC channel ID (0..7, or 31 for VDD).
+ * @param value    Output: raw right-aligned conversion result.
+ * @return TIKU_ADC_OK on success, TIKU_ADC_ERR_PARAM for a NULL pointer,
+ *         uninitialised SAADC, or unsupported channel, TIKU_ADC_ERR_TIMEOUT if
+ *         a conversion event does not assert.
+ */
+int tiku_adc_arch_read(uint8_t channel, uint16_t *value)
+{
+    uint32_t pselp;
+    int16_t  sample;
+
+    if (value == (uint16_t *)0 || tiku_saadc_ready == 0u) {
+        return TIKU_ADC_ERR_PARAM;
+    }
+
+    pselp = tiku_saadc_pselp(channel);
+    if (pselp == 0u) {
+        return TIKU_ADC_ERR_PARAM;
+    }
+
+    /* Route the input onto CH[0] in single-ended mode. */
+    TIKU_SAADC->CH[0].PSELP  = pselp;
+    TIKU_SAADC->CH[0].PSELN  = 0u;
+    TIKU_SAADC->CH[0].CONFIG = TIKU_SAADC_CH_CONFIG;
+
+    /* Point EasyDMA at the RAM result buffer.  MAXCNT is a byte count on the
+     * nRF54L, so one 16-bit sample is two bytes. */
+    tiku_saadc_result = 0;
+    TIKU_SAADC->RESULT.PTR    = (uint32_t)(&tiku_saadc_result);
+    TIKU_SAADC->RESULT.MAXCNT = TIKU_SAADC_ONE_SAMPLE;
+
+    /* Arm: clear the polled events, START, and wait for the DMA to be ready
+     * (TASKS_SAMPLE requires EVENTS_STARTED). */
+    TIKU_SAADC->EVENTS_STARTED = 0u;
+    TIKU_SAADC->EVENTS_END     = 0u;
+    TIKU_SAADC->EVENTS_STOPPED = 0u;
+
+    TIKU_SAADC->TASKS_START = 1u;
+    if (tiku_saadc_wait(&TIKU_SAADC->EVENTS_STARTED) != 0) {
+        TIKU_SAADC->TASKS_STOP = 1u;
+        return TIKU_ADC_ERR_TIMEOUT;
+    }
+
+    TIKU_SAADC->TASKS_SAMPLE = 1u;
+    if (tiku_saadc_wait(&TIKU_SAADC->EVENTS_END) != 0) {
+        TIKU_SAADC->TASKS_STOP = 1u;
+        return TIKU_ADC_ERR_TIMEOUT;
+    }
+
+    /* EVENTS_END means the sample has been written to RAM; order the buffer
+     * read after observing the event. */
+    tiku_nordic_dsb();
+    sample = tiku_saadc_result;
+
+    /* Return the converter to idle so the next read starts cleanly. */
+    TIKU_SAADC->TASKS_STOP = 1u;
+    (void)tiku_saadc_wait(&TIKU_SAADC->EVENTS_STOPPED);
+
+    /* Single-ended offset can push a grounded input a few codes negative;
+     * clamp so the unsigned result never wraps to a huge value. */
+    if (sample < 0) {
+        sample = 0;
+    }
+    *value = (uint16_t)sample;
+    return TIKU_ADC_OK;
+}

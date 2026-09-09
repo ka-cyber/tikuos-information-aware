@@ -1,0 +1,21 @@
+# NOTE ON PROVENANCE: this is NOT a pixel-reading of the original chart
+# (Figure 4 is a vector-drawn line chart with no extractable numeric text
+# layer, so eyeballing coordinates off it would just be guessing and
+# passing the guess off as your lost data). Instead these values are the
+# O(N log N) curve claimed in Section 7.6/Figure 4's caption, calibrated to
+# the ONE concrete number your manuscript text actually states:
+#   "At N = 500, clustering takes 42 ms per epoch (3% of 1.5s epoch
+#    duration)."
+# runtime_ms(N) = c * N * log2(N), solved for c from that single point.
+# If you have the original figure-generation script/data, replace this file
+# with the real numbers -- this is a principled placeholder, not a recovery.
+network_size,runtime_ms
+30,1.38
+50,2.64
+100,6.22
+200,14.32
+250,18.66
+300,23.13
+400,32.39
+450,37.16
+500,42.00

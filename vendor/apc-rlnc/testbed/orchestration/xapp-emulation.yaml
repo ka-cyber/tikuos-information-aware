@@ -1,0 +1,54 @@
+# Emulates APC-RLNC deployed as a near-RT RIC xApp (Section 8.4).
+#
+# HONEST SCOPE NOTE: this is a conceptual scaffold, not a certified O-RAN SC
+# xApp. A real xApp needs the O-RAN SC xApp framework SDK, a genuine E2
+# interface/E2SM subscription to RSSI/CQI, and A1 policy plumbing to the
+# non-RT RIC -- none of which can be faithfully reproduced without an actual
+# O-RAN SC RIC platform (e.g. an OSC RIC or OpenAirInterface near-RT RIC
+# deployment) to target. What's provided here is a Deployment that runs the
+# clustering daemon + RLNC service behind a sidecar stub that polls
+# apc-rlnc-service on the cadence described in the paper ("E2 interface:
+# reports link-level statistics... to RIC every 10ms") so the plumbing
+# points are visible and swappable once you have a real RIC to attach to.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apc-rlnc-xapp
+  namespace: apc-rlnc
+  labels:
+    app: apc-rlnc-xapp
+    oran.org/xapp: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apc-rlnc-xapp
+  template:
+    metadata:
+      labels:
+        app: apc-rlnc-xapp
+    spec:
+      containers:
+        - name: xapp-logic
+          image: apc-rlnc/clustering-go:latest
+          command: ["/apc-cluster-daemon"]
+          args:
+            - "--interface=lo"  # placeholder: bind to the RIC's E2-facing interface in a real deployment
+            - "--epoch-duration=1.5s"
+          env:
+            - name: E2_REPORT_INTERVAL_MS
+              value: "10"  # Section 8.4: "reports ... to RIC every 10ms"
+          resources:
+            requests: {cpu: "50m", memory: "32Mi"}
+            limits: {cpu: "200m", memory: "64Mi"}
+        # Placeholder sidecar: swap this container image for a real O-RAN SC
+        # E2 termination sidecar (e.g. built on the OSC E2 SDK) to actually
+        # subscribe to RSSI/CQI reports from a live RIC.
+        - name: e2-interface-stub
+          image: apc-rlnc/e2-stub:latest
+          env:
+            - name: TARGET_SERVICE
+              value: "apc-rlnc-service.apc-rlnc.svc.cluster.local:9090"
+          resources:
+            requests: {cpu: "20m", memory: "16Mi"}
+            limits: {cpu: "100m", memory: "32Mi"}

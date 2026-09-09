@@ -1,0 +1,56 @@
+# Runs the C++ hierarchical RLNC encode/decode binary (testbed/rlnc-cpp) as
+# a per-cluster service. In the paper's architecture (Figure 1) this sits
+# downstream of the clustering daemon: once Algorithm 1 assigns a node to a
+# cluster, its coding operations are handled by the cluster's RLNC service
+# replica.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apc-rlnc-service
+  namespace: apc-rlnc
+  labels:
+    app: apc-rlnc-service
+spec:
+  replicas: 3  # one per active cluster; scale via `kubectl scale` as C(t) changes
+  selector:
+    matchLabels:
+      app: apc-rlnc-service
+  template:
+    metadata:
+      labels:
+        app: apc-rlnc-service
+    spec:
+      containers:
+        - name: rlnc-cpp
+          image: apc-rlnc/rlnc-cpp:latest  # build from testbed/rlnc-cpp/Dockerfile
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: GENERATION_SIZE_K
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: GENERATION_SIZE_K}}
+            - name: BETA_SAFETY_MARGIN
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: BETA_SAFETY_MARGIN}}
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -x /usr/local/bin/rlnc_demo"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apc-rlnc-service
+  namespace: apc-rlnc
+spec:
+  selector:
+    app: apc-rlnc-service
+  ports:
+    - port: 9090
+      targetPort: 9090
+      protocol: TCP

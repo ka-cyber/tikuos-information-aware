@@ -1,0 +1,732 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_vfs.h - virtual filesystem public API and types.
+ *
+ * Exposes device state as a tree of named paths backed by read/write handlers,
+ * with no block storage and no inodes.  The shell, CoAP and application code all
+ * use the same path and get the same result.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_VFS_H_
+#define TIKU_VFS_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+/*---------------------------------------------------------------------------*/
+/* STATUS CODES                                                              */
+/*---------------------------------------------------------------------------*/
+/*
+ * Distinguishable VFS status codes.  Every error is < 0, so `rc < 0` remains a
+ * valid "did it fail?" test for every existing caller; the specific value lets
+ * a consumer -- the shell, BASIC, or an external agent driving the namespace --
+ * tell "no such node" from "read-only" from "bad value" and react accordingly
+ * (retry with a different value vs. pick another path vs. give up).
+ *
+ * A read returns a byte count >= 0 on success; it is snprintf-style, so the
+ * value is the FULL length of the rendering and a return >= the buffer size
+ * means the text was truncated (the agent's truncation signal).  Writes and
+ * typed reads return TIKU_VFS_OK (0) on success.
+ *
+ * E2BIG and EIO are reserved: the core does not yet produce them (truncation is
+ * signalled by the snprintf-style length, not an error), but they are named so
+ * handlers and consumers share one stable vocabulary as producers are added.
+ */
+enum {
+    TIKU_VFS_OK      =  0,   /**< success                                    */
+    TIKU_VFS_ERR     = -1,   /**< unspecified failure (legacy default)       */
+    TIKU_VFS_ENOENT  = -2,   /**< no such path / node                        */
+    TIKU_VFS_EACCES  = -3,   /**< not readable / not writable / wrong type   */
+    TIKU_VFS_EINVAL  = -4,   /**< malformed input or bad argument            */
+    TIKU_VFS_ERANGE  = -5,   /**< value out of range / numeric overflow      */
+    TIKU_VFS_E2BIG   = -6,   /**< (reserved) buffer too small to hold value  */
+    TIKU_VFS_EIO     = -7,   /**< (reserved) backend / hardware error        */
+    TIKU_VFS_EPERM   = -8    /**< denied by policy: caller lacks the node's
+                                  required capability (see tiku_vfs_cap_t)    */
+};
+
+/*---------------------------------------------------------------------------*/
+/* CAPABILITIES — who may write a node                                       */
+/*---------------------------------------------------------------------------*/
+/*
+ * The namespace is complete mediation for the whole OS, so mediation must be
+ * able to say NO.  Every writable node may declare a REQUIRED capability
+ * (tiku_vfs_node_t.req_cap); every write happens under a CALLER capability
+ * (the ambient trust of the channel driving the VFS — see
+ * tiku_vfs_caller_cap_set()).  tiku_vfs_write() grants iff the caller holds
+ * every bit the node requires:  (req_cap & ~caller_cap) == 0.
+ *
+ * req_cap defaults to 0 (NONE = open to anyone) so every existing node is
+ * unchanged, and the caller cap defaults to ALL (the trusted console / kernel
+ * / init path is unaffected).  The teeth appear only when an UNTRUSTED
+ * channel — a net/telnet backend, an agent link, a sandboxed BASIC program —
+ * lowers the caller cap: it is then refused the nodes that actuate hardware
+ * or touch system/safety state, while open nodes still work.
+ */
+typedef uint8_t tiku_vfs_cap_t;
+
+#define TIKU_VFS_CAP_NONE  0x00u  /**< no capability required / granted        */
+#define TIKU_VFS_CAP_HW    0x01u  /**< actuate hardware: gpio, led, i2c, pins  */
+#define TIKU_VFS_CAP_SYS   0x02u  /**< system/safety control: watchdog, clock  */
+#define TIKU_VFS_CAP_FS    0x04u  /**< mutate persistent store: /data, tier    */
+#define TIKU_VFS_CAP_NET   0x08u  /**< network config / credentials (reserved) */
+#define TIKU_VFS_CAP_ALL   0xFFu  /**< full authority: console, kernel, init   */
+
+/**
+ * @brief Short, stable, machine-greppable name for a status code.
+ *
+ * For surfacing a failure legibly (shell "(ENOENT)", BASIC, agent parsing).
+ *
+ * @param status  A value returned by a tiku_vfs_* call.
+ * @return e.g. "ENOENT", "ERANGE"; "OK" for 0; "E?" for any unknown value.
+ *         Never NULL.
+ */
+const char *tiku_vfs_strerror(int status);
+
+/*---------------------------------------------------------------------------*/
+/* NODE TYPES                                                                */
+/*---------------------------------------------------------------------------*/
+
+/** @brief VFS node type */
+typedef enum {
+    TIKU_VFS_DIR,
+    TIKU_VFS_FILE
+} tiku_vfs_type_t;
+
+/*---------------------------------------------------------------------------*/
+/* HANDLER FUNCTION TYPES                                                    */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Read handler: write human-readable value into buf
+ * @return bytes written (snprintf-style: the full length), or a negative
+ *         TIKU_VFS_* status on error
+ */
+typedef int (*tiku_vfs_read_fn)(char *buf, size_t max);
+
+/**
+ * @brief Write handler: receive string value
+ * @return TIKU_VFS_OK (0) on success, or a negative TIKU_VFS_* status on error
+ *         (e.g. TIKU_VFS_EINVAL for malformed input, TIKU_VFS_ERANGE for an
+ *         out-of-range value).  A legacy handler may still return -1
+ *         (TIKU_VFS_ERR) to mean "failed" without classifying.
+ */
+typedef int (*tiku_vfs_write_fn)(const char *buf, size_t len);
+
+/*---------------------------------------------------------------------------*/
+/* TYPE DESCRIPTORS — machine-readable node metadata                         */
+/*---------------------------------------------------------------------------*/
+/*
+ * The node struct stays minimal: handlers render and accept human
+ * text.  A node may ALSO carry one const pointer to a descriptor —
+ * a sidecar of machine-readable metadata (value type, unit, range,
+ * freshness, energy cost) that lives in rodata/FRAM and costs zero
+ * SRAM.  desc == NULL means "untyped": every existing node keeps
+ * working unchanged, and only nodes that opt in pay the (shared,
+ * const) descriptor.
+ *
+ * Descriptors are the substrate for the machine-facing layers built
+ * on top of the namespace: a binary read path (tiku_vfs_read_val), a
+ * freshness/energy-aware read cache (desc.fresh + desc.fresh_ticks),
+ * write validation (desc.vmin/vmax), a self-describing manifest for
+ * remote/agent consumers (tiku_vfs_desc_str), and per-node energy
+ * accounting (desc.ecost).
+ */
+
+/** @brief How to interpret a node's value. */
+typedef enum {
+    TIKU_VFS_T_NONE = 0,   /**< Untyped / opaque text (default) */
+    TIKU_VFS_T_U32,        /**< Unsigned integer */
+    TIKU_VFS_T_I32,        /**< Signed integer */
+    TIKU_VFS_T_BOOL,       /**< Boolean (0/1) */
+    TIKU_VFS_T_FIXED,      /**< Fixed-point integer; see desc.scale */
+    TIKU_VFS_T_STR         /**< Free text (machine path falls back to read) */
+} tiku_vfs_vtype_t;
+
+/** @brief Physical unit of a value (the integer IS expressed in this unit). */
+typedef enum {
+    TIKU_VFS_U_NONE = 0,
+    TIKU_VFS_U_BOOL,
+    TIKU_VFS_U_COUNT,
+    TIKU_VFS_U_BYTES,
+    TIKU_VFS_U_SECONDS,
+    TIKU_VFS_U_MILLIS,
+    TIKU_VFS_U_TICKS,
+    TIKU_VFS_U_HERTZ,
+    TIKU_VFS_U_MILLIVOLTS,
+    TIKU_VFS_U_MILLIAMPS,
+    TIKU_VFS_U_CELSIUS,
+    TIKU_VFS_U_MILLICELSIUS,
+    TIKU_VFS_U_PERCENT,
+    TIKU_VFS_U_ADC_RAW,
+    TIKU_VFS_U_MICROJOULES
+} tiku_vfs_unit_t;
+
+/** @brief How live a value is — what a read actually does. */
+typedef enum {
+    TIKU_VFS_FRESH_STATIC = 0, /**< Never changes after boot */
+    TIKU_VFS_FRESH_CACHED,     /**< Changes, but a read is cheap (counter/reg) */
+    TIKU_VFS_FRESH_LIVE        /**< Sampled on read; costs energy (ADC/I2C) */
+} tiku_vfs_fresh_t;
+
+/** @brief What producing a value costs — the seed of energy accounting. */
+typedef enum {
+    TIKU_VFS_E_FREE = 0,   /**< Register / SRAM read, ~free */
+    TIKU_VFS_E_CHEAP,      /**< A few cycles, no peripheral wake */
+    TIKU_VFS_E_PERIPH,     /**< Wakes a peripheral (ADC + reference) */
+    TIKU_VFS_E_BUS         /**< Off-chip bus transaction (I2C/SPI) */
+} tiku_vfs_ecost_t;
+
+/** @brief Descriptor flag bits. */
+#define TIKU_VFS_DF_NONE    0x0000u
+#define TIKU_VFS_DF_RANGE   0x0001u  /**< vmin/vmax are meaningful */
+#define TIKU_VFS_DF_HEX     0x0002u  /**< Natural rendering is hex */
+#define TIKU_VFS_DF_SECRET  0x0004u  /**< Hide on remote/agent channels */
+
+/**
+ * @brief A decoded, machine-usable node value.
+ *
+ * Produced by tiku_vfs_read_val(); the union member to read is
+ * selected by @ref vtype.  STR values are not decoded here — use the
+ * text read path for those.
+ */
+typedef struct {
+    uint8_t  vtype;   /**< tiku_vfs_vtype_t; NONE if undecodable */
+    uint8_t  unit;    /**< tiku_vfs_unit_t (copied from the descriptor) */
+    int16_t  scale;   /**< Decimal exponent for FIXED (value = raw*10^scale) */
+    union {
+        uint32_t u;   /**< U32 / FIXED / BOOL magnitude */
+        int32_t  i;   /**< I32 */
+    } as;
+} tiku_vfs_val_t;
+
+/**
+ * @brief Sidecar metadata for a typed node (const; rodata/FRAM).
+ *
+ * Optional native producer @ref read_val short-circuits the text path
+ * for hot machine-to-machine reads; when NULL, tiku_vfs_read_val()
+ * renders the node's text handler and decodes it per @ref vtype.
+ */
+typedef struct tiku_vfs_desc {
+    uint8_t  vtype;       /**< tiku_vfs_vtype_t */
+    uint8_t  unit;        /**< tiku_vfs_unit_t */
+    uint8_t  fresh;       /**< tiku_vfs_fresh_t */
+    uint8_t  ecost;       /**< tiku_vfs_ecost_t */
+    uint16_t flags;       /**< TIKU_VFS_DF_* */
+    uint16_t fresh_ticks; /**< Cache window in system ticks; 0 = always live */
+    int16_t  scale;       /**< Decimal exponent for FIXED; else 0 */
+    int32_t  vmin;        /**< Range low  (valid iff DF_RANGE) */
+    int32_t  vmax;        /**< Range high (valid iff DF_RANGE) */
+    int (*read_val)(tiku_vfs_val_t *out); /**< Native producer, or NULL */
+} tiku_vfs_desc_t;
+
+/** @brief Build a plain descriptor (no range, no caching, text-decoded). */
+#define TIKU_VFS_DESC(vt, un, fr, ec)                                       \
+    { (uint8_t)(vt), (uint8_t)(un), (uint8_t)(fr), (uint8_t)(ec),           \
+      TIKU_VFS_DF_NONE, 0u, 0, 0, 0, 0 }
+
+/** @brief Build a ranged descriptor (DF_RANGE set; vmin..vmax meaningful). */
+#define TIKU_VFS_DESC_R(vt, un, fr, ec, lo, hi)                             \
+    { (uint8_t)(vt), (uint8_t)(un), (uint8_t)(fr), (uint8_t)(ec),           \
+      TIKU_VFS_DF_RANGE, 0u, 0, (int32_t)(lo), (int32_t)(hi), 0 }
+
+/**
+ * @brief Build a ranged descriptor with a freshness/cache window.
+ *
+ * @p ticks is the read-coalescing window in system ticks (the freshness
+ * cache serves a cached value for up to this long); see
+ * kernel/vfs/tiku_vfs_cache.h.  Keep it well under a few seconds so the
+ * cache's wrap guard never false-expires it.
+ */
+#define TIKU_VFS_DESC_RF(vt, un, fr, ec, lo, hi, ticks)                     \
+    { (uint8_t)(vt), (uint8_t)(un), (uint8_t)(fr), (uint8_t)(ec),           \
+      TIKU_VFS_DF_RANGE, (uint16_t)(ticks), 0, (int32_t)(lo), (int32_t)(hi), 0 }
+
+/*---------------------------------------------------------------------------*/
+/* DYNAMIC DIRECTORIES — runtime-populated children (e.g. a file store)      */
+/*---------------------------------------------------------------------------*/
+/*
+ * A DIR node may carry an optional `dyn` ops pointer.  When set, the directory
+ * has children that are NOT in the static children[] array but are resolved at
+ * run time -- the file store mounts /data this way.  The static tree is
+ * unchanged: read/write fall back to the dyn ops ONLY when a path fails to
+ * resolve statically, and list() enumerates the static children and then the
+ * dynamic ones.  A dynamic child is addressed BY NAME (the const node handlers
+ * carry no file identity), so the ops take the name.
+ */
+
+/** @brief Per-name callback for tiku_vfs_dynops.list(). */
+typedef void (*tiku_vfs_dyn_list_cb)(const char *name, void *ctx);
+
+/** @brief Runtime child operations for a dynamic directory. */
+typedef struct tiku_vfs_dynops {
+    void (*list)  (tiku_vfs_dyn_list_cb cb, void *ctx);           /**< enumerate  */
+    int  (*read)  (const char *name, char *buf, size_t max);      /**< read child */
+    int  (*write) (const char *name, const char *buf, size_t len);/**< write/create */
+    int  (*unlink)(const char *name);                            /**< delete child */
+    /** Optional: enumerate the immediate children under @p prefix ("" = root,
+     *  "logs/" = a sub-folder), reporting virtual folders with a trailing '/'.
+     *  NULL on a purely flat store -- the VFS then falls back to list(). */
+    void (*list_dir)(const char *prefix, tiku_vfs_dyn_list_cb cb, void *ctx);
+} tiku_vfs_dynops_t;
+
+/*---------------------------------------------------------------------------*/
+/* VFS NODE                                                                  */
+/*---------------------------------------------------------------------------*/
+
+/** @brief A node in the VFS tree */
+typedef struct tiku_vfs_node {
+    const char                  *name;        /**< Path component */
+    tiku_vfs_type_t              type;         /**< DIR or FILE */
+    tiku_vfs_read_fn             read;         /**< NULL if not readable */
+    tiku_vfs_write_fn            write;        /**< NULL if not writable */
+    const struct tiku_vfs_node  *children;     /**< For DIR: child array */
+    uint8_t                      child_count;  /**< For DIR: child count */
+    const tiku_vfs_desc_t       *desc;         /**< Type descriptor; NULL =
+                                                    untyped (back-compat) */
+    const struct tiku_vfs_dynops *dyn;         /**< Dynamic children; NULL =
+                                                    static dir (back-compat) */
+    tiku_vfs_cap_t               req_cap;       /**< Capability a writer must
+                                                    hold; 0 (NONE) = open, and
+                                                    zero-init leaves untagged
+                                                    nodes open. */
+} tiku_vfs_node_t;
+
+/*---------------------------------------------------------------------------*/
+/* LIST CALLBACK                                                             */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Callback for tiku_vfs_list(), called once per child
+ */
+typedef void (*tiku_vfs_list_fn)(const struct tiku_vfs_node *node,
+                                  void *ctx);
+
+/*---------------------------------------------------------------------------*/
+/* PUBLIC API                                                                */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Initialize VFS with root node
+ * @param root  Root directory node of the tree
+ */
+void tiku_vfs_init(const tiku_vfs_node_t *root);
+
+/**
+ * @brief Extract the next segment of a slash-separated path.
+ *
+ * The one definition of TikuOS path lexing, shared by every segment walker so
+ * they cannot drift: runs of slashes collapse, a trailing slash yields no
+ * empty segment, and an all-slash remainder is the end of the path.
+ *
+ * @param p    Cursor into the path; advanced past the extracted
+ *             segment (left on the terminating '/' or NUL).
+ * @param seg  Receives the start of the segment (not NUL-terminated).
+ * @param len  Receives the segment length in bytes (always > 0 on a
+ *             1 return).
+ * @return 1 if a segment was extracted, 0 at end of path.
+ */
+static inline int
+tiku_vfs_next_segment(const char **p, const char **seg, size_t *len)
+{
+    while (**p == '/') (*p)++;               /* collapse slash runs   */
+    if (**p == '\0') return 0;               /* end / trailing slash  */
+    *seg = *p;
+    while (**p != '/' && **p != '\0') (*p)++;
+    *len = (size_t)(*p - *seg);
+    return 1;
+}
+
+/**
+ * @brief Resolve a path to its node
+ * @param path  Absolute path (must start with "/")
+ * @return Matching node, or NULL if not found
+ */
+const tiku_vfs_node_t *tiku_vfs_resolve(const char *path);
+
+/**
+ * @brief Read from a path
+ * @param path  Absolute path to a FILE node
+ * @param buf   Output buffer
+ * @param max   Buffer capacity
+ * @return Bytes written to buf, or -1 on error
+ */
+int tiku_vfs_read(const char *path, char *buf, size_t max);
+
+/**
+ * @brief Read directly from a resolved node, skipping the path walk.
+ *
+ * For callers that already hold a node pointer (a watch event delivers one;
+ * the rules engine and `watch` cache one at arm time).  Same readable-FILE
+ * validation and error contract as tiku_vfs_read().
+ *
+ * @param node  Node to read (NULL tolerated → -1)
+ * @param buf   Output buffer
+ * @param max   Buffer capacity
+ * @return Bytes written to buf, or -1 on error
+ */
+int tiku_vfs_read_node(const tiku_vfs_node_t *node, char *buf, size_t max);
+
+/*---------------------------------------------------------------------------*/
+/* TYPED ACCESS — descriptor-driven, machine-facing reads                    */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Return a node's type descriptor.
+ * @return The descriptor, or NULL if the node is untyped / NULL.
+ */
+const tiku_vfs_desc_t *tiku_vfs_desc_of(const tiku_vfs_node_t *node);
+
+/**
+ * @brief Read a node as a decoded, typed value.
+ *
+ * Requires a descriptor: a native producer (desc.read_val) is used when
+ * present, otherwise the text handler is rendered once and decoded per the
+ * declared type.  Untyped and STR nodes return -1; read those as text.
+ *
+ * @param path  Absolute path to a typed FILE node
+ * @param out   Decoded value (always zeroed first; vtype=NONE on failure)
+ * @return 0 on success, -1 otherwise
+ */
+int tiku_vfs_read_val(const char *path, tiku_vfs_val_t *out);
+
+/** @brief By-node form of tiku_vfs_read_val() (skips the path walk). */
+int tiku_vfs_read_val_node(const tiku_vfs_node_t *node, tiku_vfs_val_t *out);
+
+/**
+ * @brief Render a node's descriptor as a one-line human/manifest string.
+ *
+ * e.g. "u32 Hz cost=free fresh=static\n", or "i32 mC [-40000..125000]
+ * cost=periph fresh=live\n".  "untyped\n" when the node has no
+ * descriptor.  Newline-terminated, snprintf-style return.
+ *
+ * @return Bytes that would be written (>=0), or -1 on bad args.
+ */
+int tiku_vfs_desc_str(const tiku_vfs_node_t *node, char *buf, size_t max);
+
+/**
+ * @brief Write to a path
+ * @param path  Absolute path to a writable FILE node
+ * @param data  Data to write
+ * @param len   Data length
+ * @return 0 on success, -1 on error
+ */
+int tiku_vfs_write(const char *path, const char *data, size_t len);
+
+/*---------------------------------------------------------------------------*/
+/* CALLER CAPABILITY — the ambient trust of the channel driving the VFS      */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Set the ambient caller capability; returns the previous value.
+ *
+ * One control plane (the shell) drives every VFS write, so the cap is an
+ * ambient word rather than a per-call argument.  It defaults to
+ * TIKU_VFS_CAP_ALL; net/agent backends and untrusted sub-contexts narrow it.
+ *
+ * @param cap  New ambient capability
+ * @return     Previous value (save it to restore on the way out)
+ */
+tiku_vfs_cap_t tiku_vfs_caller_cap_set(tiku_vfs_cap_t cap);
+
+/** @brief Current ambient caller capability. */
+tiku_vfs_cap_t tiku_vfs_caller_cap_get(void);
+
+/**
+ * @brief Delete a file at @p path.
+ *
+ * Only dynamic directories (a file store mounted via dynops) support removal;
+ * a static node, or a directory without an unlink op, returns -1.  On success
+ * the parent directory's watchers are rung, exactly like a write.
+ *
+ * @param path  Absolute path to a dynamic FILE node
+ * @return 0 on success, -1 on error (not found / not removable)
+ */
+int tiku_vfs_unlink(const char *path);
+
+/**
+ * @brief List directory contents
+ * @param path      Absolute path to a DIR node
+ * @param callback  Called once per child
+ * @param ctx       User context passed to callback
+ * @return 0 on success, -1 on error (not found or not a directory)
+ */
+int tiku_vfs_list(const char *path, tiku_vfs_list_fn callback, void *ctx);
+
+/**
+ * @brief Is @p path a directory?
+ *
+ * True for a static DIR node and for a virtual sub-folder of a dynamic store
+ * (path-as-name): a path with at least one child under it, or an mkdir marker.
+ * False for a file or a non-existent path.  Used by `cd`.
+ *
+ * @return 1 if @p path is a directory, 0 otherwise.
+ */
+int tiku_vfs_is_dir(const char *path);
+
+/*---------------------------------------------------------------------------*/
+/* WATCH — change notification on nodes                                      */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * The namespace as event bus: a process subscribes to a FILE node
+ * and receives TIKU_EVENT_VFS (data = the node pointer) whenever the
+ * node changes.  Two trigger paths feed the same subscription:
+ *
+ *   1. Every successful tiku_vfs_write() notifies watchers of the
+ *      written node automatically — shell writes, BASIC writes and
+ *      network writes all ring for free.
+ *   2. Drivers whose values change without a write (a GPIO edge, a
+ *      sensor threshold) call tiku_vfs_notify() explicitly.
+ *
+ * Node-pointer identity is the subscription key: the tree is static,
+ * so node addresses are stable for the life of the system, and the
+ * event's data field carries the same pointer back to the receiver
+ * for dispatch.  The watch table is a fixed array of slots in SRAM
+ * (subscriptions are per-boot; processes re-subscribe at init).
+ *
+ * Delivery semantics: one event per trigger, no coalescing — the
+ * event means "this node was touched", and the receiver reads the
+ * node for the current value.  Several queued events for one node
+ * are harmless re-reads.  An event is posted even when a write
+ * stored the same value as before (writes are not compared against
+ * prior content).
+ *
+ * Context rules: tiku_vfs_notify() is ISR-safe (it only scans the
+ * table and posts events; tiku_process_post() is ISR-safe, and
+ * table mutation is interrupt-masked).  watch/unwatch are
+ * process-context calls.
+ */
+
+/** Forward declaration — receivers are kernel processes */
+struct tiku_process;
+
+/** @brief Watch-table capacity (subscription slots) */
+#ifndef TIKU_VFS_WATCH_MAX
+#define TIKU_VFS_WATCH_MAX  8
+#endif
+
+/**
+ * @brief Subscribe a process to changes of a FILE node.
+ *
+ * Resolves @p path now and stores the (node, process) pair in a free slot;
+ * subscribing the same pair twice returns the existing slot.  Thereafter each
+ * write and each tiku_vfs_notify() posts TIKU_EVENT_VFS to @p p, node as data.
+ *
+ * @param path  Absolute path to a FILE node
+ * @param p     Receiving process
+ * @return Slot index (>= 0), or -1 on bad path, non-FILE node,
+ *         NULL process, or full table
+ */
+int8_t tiku_vfs_watch(const char *path, struct tiku_process *p);
+
+/**
+ * @brief Remove one (path, process) subscription.
+ *
+ * @param path  The watched path
+ * @param p     The subscribed process
+ * @return 0 when a subscription was removed, -1 when none matched
+ */
+int8_t tiku_vfs_unwatch(const char *path, struct tiku_process *p);
+
+/**
+ * @brief Remove every subscription held by @p p.
+ *
+ * The bulk form used on re-arm (drop everything, re-subscribe from
+ * scratch) and on process teardown.
+ *
+ * @param p  The subscribed process
+ */
+void tiku_vfs_unwatch_all(struct tiku_process *p);
+
+/**
+ * @brief Ring the watchers of @p node.
+ *
+ * Called automatically by tiku_vfs_write() on success; called
+ * explicitly by drivers whose node values change without a write.
+ * ISR-safe.  No-op when nobody watches the node.
+ *
+ * @param node  The node that changed (as returned by
+ *              tiku_vfs_resolve())
+ */
+void tiku_vfs_notify(const tiku_vfs_node_t *node);
+
+/*---------------------------------------------------------------------------*/
+/* CHANGE RECORDS -- what changed, not merely that something did             */
+/*---------------------------------------------------------------------------*/
+/*
+ * A watch event says "this node was touched".  That is enough for a
+ * subscriber holding one node, and not enough for anything holding a
+ * LISTING: a browser cannot tell an appearing node from a changed one,
+ * so it has to re-read the whole namespace to find out, on every tick.
+ *
+ * The ring below answers the question instead.  Each notify appends
+ * {node, opcode, sequence}; a reader drains it and learns what happened
+ * and to which node.  Two properties make it cheap enough for a static
+ * device: it is fixed-size SRAM, and it DROPS rather than blocks --
+ * losing records is safe because the reader is told it happened and can
+ * fall back to a re-read, whereas blocking an ISR is not.
+ */
+
+/** @brief What happened to a node. */
+typedef enum {
+    TIKU_VFS_OP_CHANGED = 0,   /* value moved: a write, or a driver     */
+    TIKU_VFS_OP_CREATED,       /* appeared in a dynamic directory       */
+    TIKU_VFS_OP_REMOVED,       /* gone from a dynamic directory         */
+    TIKU_VFS_OP_MOVED          /* same node, new name                   */
+} tiku_vfs_op_t;
+
+/** @brief Change-ring capacity, in records. */
+#ifndef TIKU_VFS_EVENTS_MAX
+#define TIKU_VFS_EVENTS_MAX  16
+#endif
+
+/** @brief One change record. */
+typedef struct {
+    const tiku_vfs_node_t *node;
+    uint8_t                op;      /* tiku_vfs_op_t                    */
+    uint16_t               seq;     /* wraps; gaps mean records were lost */
+} tiku_vfs_change_t;
+
+/**
+ * @brief Ring the watchers of @p node AND record what happened.
+ *
+ * The opcode-carrying form of tiku_vfs_notify().  ISR-safe.  Plain
+ * tiku_vfs_notify() is this with TIKU_VFS_OP_CHANGED, which is what a
+ * value move is.
+ *
+ * @param node  The node that changed
+ * @param op    What happened to it
+ */
+void tiku_vfs_notify_op(const tiku_vfs_node_t *node, tiku_vfs_op_t op);
+
+/**
+ * @brief Take the pending change records, oldest first.
+ *
+ * Draining is destructive: a record is delivered once.  A reader that
+ * wants them shared should read /sys/vfs/events, which renders the same
+ * ring as text.
+ *
+ * @param out  Destination array (NULL to discard)
+ * @param max  Capacity of @p out
+ * @return Records written
+ */
+uint8_t tiku_vfs_events_take(tiku_vfs_change_t *out, uint8_t max);
+
+/**
+ * @brief How many records are waiting.
+ * @return Pending count in [0, TIKU_VFS_EVENTS_MAX]
+ */
+uint8_t tiku_vfs_events_pending(void);
+
+/**
+ * @brief How many records have been DROPPED because the ring was full.
+ *
+ * Non-zero tells a reader its picture is incomplete and it must re-read
+ * rather than trust the records it did get.  Silent loss is the failure
+ * this counter exists to prevent.
+ *
+ * @return Cumulative drops since boot
+ */
+uint16_t tiku_vfs_events_dropped(void);
+
+/*
+ * The tree is static, so a node's address is its identity for the life of
+ * the boot: the same value however the node is reached, unchanged when its
+ * name or its value changes.  It is an opaque token, and equality is the
+ * only operation defined on it -- what lets a reader tell "the node I was
+ * looking at, renamed" from "a different node", which a path cannot say.
+ */
+/**
+ * @brief The stable identity of @p node, an opaque token.
+ *
+ * @param node  Any node, or NULL
+ * @return The token, or 0 for NULL
+ */
+uint32_t tiku_vfs_node_id(const tiku_vfs_node_t *node);
+
+/*---------------------------------------------------------------------------*/
+/* INTROSPECTION — read-only views of VFS state                              */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Suggested buffer size for tiku_vfs_path_of().
+ *
+ * Comfortably exceeds the deepest path in the stock tree; sizes a
+ * caller's scratch buffer without hard-coding a magic number.
+ */
+#ifndef TIKU_VFS_PATH_MAX
+#define TIKU_VFS_PATH_MAX  64
+#endif
+
+/* Scratch-buffer size for the core's internal path-prefix reconstruction
+ * (parent-of / list / is-dir).  Holds a full path plus a little slack; kept in
+ * one place so those buffers stay in lockstep with TIKU_VFS_PATH_MAX instead of
+ * each hard-coding a magic 80. */
+#define TIKU_VFS_PATHBUF   (TIKU_VFS_PATH_MAX + 16)
+
+/**
+ * @brief Number of watch slots currently in use.
+ * @return Used slots in [0, TIKU_VFS_WATCH_MAX]; free = MAX - used.
+ */
+uint8_t tiku_vfs_watch_used(void);
+
+/**
+ * @brief Read one watch slot's (node, process) pair.
+ *
+ * @param i     Slot index in [0, TIKU_VFS_WATCH_MAX)
+ * @param node  Out: watched node (NULL to ignore)
+ * @param proc  Out: subscribed process (NULL to ignore)
+ * @return 0 if the slot is in use, -1 if free or out of range
+ */
+int8_t tiku_vfs_watch_get(uint8_t i, const tiku_vfs_node_t **node,
+                          struct tiku_process **proc);
+
+/**
+ * @brief Reverse-resolve a node pointer to its absolute path.
+ *
+ * DFS from the root (the tree has no parent links); O(tree size),
+ * for cold observability reads, not a hot path.  The root resolves
+ * to "/".
+ *
+ * @param node  Node to name (must be in the tree)
+ * @param buf   Output buffer (size >= TIKU_VFS_PATH_MAX recommended)
+ * @param max   Buffer capacity
+ * @return Path length, or -1 if not found / bad args
+ */
+int tiku_vfs_path_of(const tiku_vfs_node_t *node, char *buf, size_t max);
+
+/**
+ * @brief Total nodes in the tree (dirs + files), counted live.
+ * @return Node count, or 0 before tiku_vfs_init()
+ */
+uint16_t tiku_vfs_count(void);
+
+/**
+ * @brief Deepest path in the tree, in components (root alone = 1).
+ * @return Max depth, or 0 before tiku_vfs_init()
+ */
+uint8_t tiku_vfs_depth(void);
+
+/**
+ * @brief Render the whole static namespace as a machine-readable manifest.
+ *
+ * One tab-separated line per node, after a `#`-prefixed header row:
+ * `path  type  perms  vtype  unit  fresh  cost  range`.  Dynamic-directory
+ * children are not walked -- capability metadata only.
+ *
+ * @param buf  Output buffer
+ * @param max  Buffer capacity
+ * @return Total manifest length in bytes; a value >= @p max means the
+ *         manifest was truncated (snprintf-style)
+ */
+int tiku_vfs_manifest(char *buf, size_t max);
+
+#endif /* TIKU_VFS_H_ */

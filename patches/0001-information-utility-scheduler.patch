@@ -1,0 +1,263 @@
+diff --git a/Makefile b/Makefile
+index 35e992a..6bce0e4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1345,6 +1345,16 @@ endif
+ CFLAGS += -DTIKU_THREADS_ENABLE=1
+ endif
+ 
++# Optional stage-1 information-utility scheduler. Generic and opt-in.
++ifeq ($(TIKU_UTILITY_ENABLE),1)
++ifeq ($(TIKU_THREADS_ENABLE),1)
++CFLAGS += -DTIKU_UTILITY_ENABLE=1
++SRCS += kernel/utility/tiku_utility.c
++else
++$(error TIKU_UTILITY_ENABLE=1 requires TIKU_THREADS_ENABLE=1)
++endif
++endif
++
+ # UART baud rate (default 9600; override: make UART_BAUD=115200)
+ UART_BAUD ?=
+ ifneq ($(UART_BAUD),)
+diff --git a/kernel/threads/tiku_thread.c b/kernel/threads/tiku_thread.c
+index 6329c70..e9b1730 100644
+--- a/kernel/threads/tiku_thread.c
++++ b/kernel/threads/tiku_thread.c
+@@ -19,6 +19,9 @@
+ /*---------------------------------------------------------------------------*/
+ 
+ #include "tiku_thread.h"
++#if defined(TIKU_UTILITY_ENABLE) && TIKU_UTILITY_ENABLE
++#include "../utility/tiku_utility.h"
++#endif
+ #include <hal/tiku_cpu.h>            /* tiku_atomic_enter/exit */
+ 
+ /*---------------------------------------------------------------------------*/
+@@ -151,11 +154,35 @@ uint32_t *tiku_thread_switch(uint32_t *old_sp)
+      * the round-robin cursor.  An exhausted worker is skipped here, so it
+      * silently loses its turn until a refill lifts it back over budget. */
+     if (!s_kernel_ready) {
+-        for (i = 0; i < TIKU_THREADS_MAX; i++) {
+-            uint8_t idx = (uint8_t)((s_rr + i) % TIKU_THREADS_MAX);
+-            if (worker_runnable(s_threads[idx])) {
+-                next = s_threads[idx];
+-                break;
++#if defined(TIKU_UTILITY_ENABLE) && TIKU_UTILITY_ENABLE
++        {
++            /*
++             * Filter with the scheduler's authoritative runnable predicate
++             * before ranking. The utility module remains opaque to TikuOS
++             * lifecycle/budget state; NULL denotes a non-runnable candidate.
++             */
++            tiku_thread_t *utility_candidates[TIKU_THREADS_MAX];
++            for (i = 0; i < TIKU_THREADS_MAX; i++) {
++                utility_candidates[i] =
++                    worker_runnable(s_threads[i]) ? s_threads[i] :
++                    (tiku_thread_t *)0;
++            }
++            {
++                int selected = tiku_utility_select(
++                    utility_candidates, TIKU_THREADS_MAX, s_rr, now);
++                if (selected >= 0) {
++                    next = s_threads[selected];
++                }
++            }
++        }
++#endif
++        if (next == (tiku_thread_t *)0) {
++            for (i = 0; i < TIKU_THREADS_MAX; i++) {
++                uint8_t idx = (uint8_t)((s_rr + i) % TIKU_THREADS_MAX);
++                if (worker_runnable(s_threads[idx])) {
++                    next = s_threads[idx];
++                    break;
++                }
+             }
+         }
+     }
+@@ -213,6 +240,11 @@ int tiku_thread_start(tiku_thread_t *t, void (*entry)(void *), void *arg)
+     }
+     s_threads[slot] = t;
+ 
++#if defined(TIKU_UTILITY_ENABLE) && TIKU_UTILITY_ENABLE
++    /* Hints describe a workload instance; never inherit one across restart. */
++    tiku_utility_hint_clear(t);
++#endif
++
+     t->entry = entry;
+     t->arg   = arg;
+     t->stack_base[0] = THREAD_CANARY;
+diff --git a/kernel/utility/tiku_utility.c b/kernel/utility/tiku_utility.c
+new file mode 100644
+index 0000000..c1317e8
+--- /dev/null
++++ b/kernel/utility/tiku_utility.c
+@@ -0,0 +1,116 @@
++/*
++ * TikuOS information-utility contract implementation.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#include "tiku_utility.h"
++#include "../threads/tiku_thread.h"
++
++#ifndef TIKU_UTILITY_MAX_THREADS
++#define TIKU_UTILITY_MAX_THREADS TIKU_THREADS_MAX
++#endif
++#if TIKU_UTILITY_MAX_THREADS != TIKU_THREADS_MAX
++#error "TIKU_UTILITY_MAX_THREADS must match TIKU_THREADS_MAX"
++#endif
++
++static tiku_utility_hint_t s_hints[TIKU_UTILITY_MAX_THREADS];
++static struct tiku_thread *s_owner[TIKU_UTILITY_MAX_THREADS];
++
++static int find_slot(const struct tiku_thread *thread)
++{
++    uint8_t i;
++    if (!thread) return -1;
++    for (i = 0; i < TIKU_UTILITY_MAX_THREADS; ++i)
++        if (s_owner[i] == thread) return (int)i;
++    return -1;
++}
++
++static int alloc_slot(struct tiku_thread *thread)
++{
++    int free_slot = -1;
++    uint8_t i;
++    if (!thread) return -1;
++    for (i = 0; i < TIKU_UTILITY_MAX_THREADS; ++i) {
++        if (s_owner[i] == thread) return (int)i;
++        if (free_slot < 0 && !s_owner[i]) free_slot = (int)i;
++    }
++    if (free_slot >= 0) s_owner[free_slot] = thread;
++    return free_slot;
++}
++
++int tiku_utility_hint_set(struct tiku_thread *thread, uint16_t utility_q16,
++                          uint32_t deadline_tick, uint32_t cost_cycles,
++                          uint8_t flags)
++{
++    int slot;
++    if (!thread || cost_cycles == 0u) return -1;
++    slot = alloc_slot(thread);
++    if (slot < 0) return -1;
++    s_hints[slot].utility_q16 = utility_q16;
++    s_hints[slot].deadline_tick = deadline_tick;
++    s_hints[slot].cost_cycles = cost_cycles;
++    s_hints[slot].flags = flags;
++    s_hints[slot].valid = 1u;
++    return 0;
++}
++
++void tiku_utility_hint_clear(struct tiku_thread *thread)
++{
++    int slot = find_slot(thread);
++    if (slot >= 0) {
++        s_hints[slot].valid = 0u;
++        s_owner[slot] = (struct tiku_thread *)0;
++    }
++}
++
++int tiku_utility_hint_get(const struct tiku_thread *thread,
++                          tiku_utility_hint_t *out)
++{
++    int slot;
++    if (!out) return -1;
++    slot = find_slot(thread);
++    if (slot < 0 || !s_hints[slot].valid) return -1;
++    *out = s_hints[slot];
++    return 0;
++}
++
++uint32_t tiku_utility_score(const tiku_utility_hint_t *hint)
++{
++    uint64_t numerator;
++    if (!hint || !hint->valid || hint->cost_cycles == 0u) return 0u;
++    numerator = ((uint64_t)hint->utility_q16 << 16);
++    numerator /= (uint64_t)hint->cost_cycles;
++    return numerator > 0xffffffffULL ? 0xffffffffu : (uint32_t)numerator;
++}
++
++int tiku_utility_deadline_eligible(const tiku_utility_hint_t *hint,
++                                   uint32_t now)
++{
++    uint32_t delta;
++    if (!hint || !hint->valid) return 0;
++    if ((hint->flags & TIKU_UTILITY_FLAG_DEADLINE) == 0u) return 1;
++    delta = hint->deadline_tick - now;
++    return ((int32_t)delta >= 0);
++}
++
++int tiku_utility_select(struct tiku_thread *const *threads, uint8_t count,
++                        uint8_t cursor, uint32_t now)
++{
++    uint8_t offset;
++    int best = -1;
++    uint32_t best_score = 0u;
++    if (!threads || count == 0u) return -1;
++    for (offset = 0; offset < count; ++offset) {
++        uint8_t idx = (uint8_t)((cursor + offset) % count);
++        tiku_utility_hint_t hint;
++        uint32_t score;
++        if (!threads[idx]) continue;
++        if (tiku_utility_hint_get(threads[idx], &hint) != 0) continue;
++        if (!tiku_utility_deadline_eligible(&hint, now)) continue;
++        score = tiku_utility_score(&hint);
++        if (best < 0 || score > best_score) {
++            best = (int)idx;
++            best_score = score;
++        }
++    }
++    return best;
++}
+diff --git a/kernel/utility/tiku_utility.h b/kernel/utility/tiku_utility.h
+new file mode 100644
+index 0000000..0c420df
+--- /dev/null
++++ b/kernel/utility/tiku_utility.h
+@@ -0,0 +1,47 @@
++/*
++ * TikuOS information-utility contract.
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#ifndef TIKU_UTILITY_H_
++#define TIKU_UTILITY_H_
++#include <stdint.h>
++
++struct tiku_thread;
++
++#define TIKU_UTILITY_Q16_MAX ((uint16_t)65535u)
++#define TIKU_UTILITY_FLAG_DEADLINE ((uint8_t)0x01u)
++
++typedef struct tiku_utility_hint {
++    uint16_t utility_q16;
++    uint32_t deadline_tick;
++    uint32_t cost_cycles;
++    uint8_t flags;
++    uint8_t valid;
++} tiku_utility_hint_t;
++
++int tiku_utility_hint_set(struct tiku_thread *thread, uint16_t utility_q16,
++                          uint32_t deadline_tick, uint32_t cost_cycles,
++                          uint8_t flags);
++void tiku_utility_hint_clear(struct tiku_thread *thread);
++int tiku_utility_hint_get(const struct tiku_thread *thread,
++                          tiku_utility_hint_t *out);
++
++/* Exact ordering score: floor(utility_q16 * 2^16 / cost_cycles). */
++uint32_t tiku_utility_score(const tiku_utility_hint_t *hint);
++
++/*
++ * Modular deadline predicate. The caller must keep deadlines within
++ * 2^31-1 ticks of now; equality is eligible.
++ */
++int tiku_utility_deadline_eligible(const tiku_utility_hint_t *hint,
++                                   uint32_t now);
++
++/*
++ * Select only among non-NULL candidates. NULL candidates are excluded by
++ * construction, so scheduler state is authoritative and cannot be bypassed.
++ * Ties are deterministic: cursor order wins.
++ */
++int tiku_utility_select(struct tiku_thread *const *threads, uint8_t count,
++                        uint8_t cursor, uint32_t now);
++
++#endif

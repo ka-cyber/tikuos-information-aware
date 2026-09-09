@@ -1,0 +1,136 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_crypto_arch.h - nRF54L CRACEN CryptoMaster offload (hash first).
+ *
+ * Hardware acceleration behind the software crypto APIs, selected at run time:
+ * auto tries the engine and falls back to software on any error, sw forces the
+ * reference path.  Counters expose which path ran, so tests can assert it.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_NORDIC_CRYPTO_ARCH_H_
+#define TIKU_NORDIC_CRYPTO_ARCH_H_
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define TIKU_CRYPTO_HW_MODE_AUTO  0u
+#define TIKU_CRYPTO_HW_MODE_SW    1u
+
+/** @brief Get the runtime engine mode (AUTO=0, SW=1). */
+uint8_t tiku_crypto_hw_mode(void);
+
+/** @brief Set the runtime engine mode (AUTO=0, SW=1). */
+void    tiku_crypto_hw_mode_set(uint8_t mode);
+
+/** @brief Path counters: ops served by hardware, by software, hw errors. */
+void    tiku_crypto_hw_counters(uint16_t *hw_ops, uint16_t *sw_ops,
+                                uint16_t *hw_errs);
+
+/** @brief Kit software paths call this when they serve an op. */
+void    tiku_crypto_hw_count_sw(void);
+
+/**
+ * @brief One-shot SHA-256 of @p len bytes at @p msg into @p out[32].
+ * @return 0 on success; negative if the engine errored (caller falls back).
+ */
+int tiku_crypto_arch_sha256(const void *msg, size_t len, uint8_t out[32]);
+
+/**
+ * @brief One-shot AES-GCM through the BA411 engine.
+ *
+ * @param decrypt    0 = encrypt, 1 = decrypt (tag is PRODUCED either way;
+ *                   the caller compares on decrypt)
+ * @param cfg_extra  extra config-word bits (bring-up knob; 0 in production)
+ * @param out        needs align-4 headroom past @p in_sz (FIFO realign)
+ * @return 0 ok; -2 unsupported shape (caller falls back to software)
+ */
+/**
+ * @brief One-block AES-ECB through the BA411E engine (the raw block cipher).
+ * @return 0 on success, -2 on bad key size / DMA error.
+ */
+int tiku_crypto_arch_aes_ecb(int decrypt, const uint8_t *key, size_t key_sz,
+                             const uint8_t in[16], uint8_t out[16]);
+
+/**
+ * @brief AES-CCM* (IEEE 802.15.4, L=2 / 13-byte nonce) over the hardware ECB.
+ * encrypt: @p out=ciphertext, @p mic=tag.  decrypt: @p m=ciphertext,
+ * @p out=plaintext, @p mic=recomputed tag (compare with the received one).
+ * @param mic_len 4, 8, or 16.  @return 0 ok, -2 bad args, <0 engine error.
+ */
+int tiku_crypto_arch_aes_ccm_star(int decrypt, const uint8_t *key,
+                                  size_t key_sz, const uint8_t nonce[13],
+                                  const uint8_t *aad, size_t aad_len,
+                                  const uint8_t *m, size_t m_len,
+                                  uint8_t mic_len, uint8_t *out, uint8_t *mic);
+
+int tiku_crypto_arch_aes_gcm(int decrypt, uint32_t cfg_extra,
+                             const uint8_t *key, size_t key_sz,
+                             const uint8_t iv[12],
+                             const uint8_t *aad, size_t aad_sz,
+                             const uint8_t *in, size_t in_sz,
+                             uint8_t *out, uint8_t tag[16]);
+
+/** @brief Kit-safe AES-GCM (staged; no caller alignment/RRAM constraints). */
+int tiku_crypto_arch_aes_gcm_kit(int decrypt,
+                                 const uint8_t *key, size_t key_sz,
+                                 const uint8_t iv[12],
+                                 const uint8_t *aad, size_t aad_sz,
+                                 const uint8_t *in, size_t in_sz,
+                                 uint8_t *out, uint8_t tag[16]);
+
+#if defined(TIKU_CRACEN_PK_ENABLE)
+/** @brief ECDSA-P256 verify on the BA414EP PK engine. 0=valid 1=invalid <0=err. */
+int tiku_crypto_arch_p256_ecdsa_verify(const uint8_t qx[32], const uint8_t qy[32],
+                                       const uint8_t *h, size_t hlen,
+                                       const uint8_t r[32], const uint8_t s[32]);
+
+/** @brief ECDSA-P384 verify on the BA414EP PK engine. 0=valid 1=invalid <0=err. */
+int tiku_crypto_arch_p384_ecdsa_verify(const uint8_t qx[48], const uint8_t qy[48],
+                                       const uint8_t *h, size_t hlen,
+                                       const uint8_t r[48], const uint8_t s[48]);
+
+/** @brief PK path counters (ops served, engine errors). */
+void tiku_crypto_arch_pk_counters(uint16_t *ops, uint16_t *errs);
+
+void tiku_crypto_arch_pk_dbg(uint32_t *status, uint32_t *cmd, uint32_t *spin,
+                            uint32_t *slotsz);
+
+/** @brief Upload a caller-provided BA414EP microcode image (TikuOS ships none). */
+void tiku_crypto_arch_pk_load_microcode(const uint32_t *ucode, size_t words);
+
+/** @brief First word of the PK microcode RAM (0 => not loaded). */
+uint32_t tiku_crypto_arch_pk_ucode0(void);
+
+/** @brief Raw PK HWCONFIG register (bring-up: max operand size in bits 0..11). */
+uint32_t tiku_crypto_arch_pk_hwconfig(void);
+#endif /* TIKU_CRACEN_PK_ENABLE */
+
+/*---------------------------------------------------------------------------*/
+/* Bring-up probes (cryptoprobe shell command; not part of the kit contract) */
+/*---------------------------------------------------------------------------*/
+
+/** @brief Run the hash engine with an arbitrary config word (bring-up). */
+int tiku_crypto_arch_hash_probe(uint32_t cfg, const void *msg, size_t len,
+                                uint8_t *out, size_t outlen);
+
+/** @brief DMA self-test: fetch -> bypass engine -> push (no crypto). */
+int tiku_crypto_arch_bypass_probe(const void *msg, size_t len, uint8_t *out);
+
+/** @brief DIRECT-mode DMA self-test (no descriptors at all). */
+int tiku_crypto_arch_direct_probe(const void *msg, size_t len, uint8_t *out);
+
+/** @brief Bring-up debug: last INTSTATRAW/STATUS, live SEEDVALID, stage. */
+void tiku_crypto_arch_dbg(uint32_t *ints, uint32_t *status,
+                          uint32_t *seedvalid, uint32_t *stage);
+
+/** @brief Read a CRYPTMSTRHW fused-configuration word (idx 0..6). */
+uint32_t tiku_crypto_arch_hwcfg(uint8_t idx);
+
+#endif /* TIKU_NORDIC_CRYPTO_ARCH_H_ */

@@ -1,0 +1,7 @@
+Apache License 2.0
+
+Copyright 2026 TikuOS Information-Aware Scheduling contributors.
+
+This repository's original research code is licensed under Apache-2.0. Vendored
+upstream components retain their original licenses in their respective trees.
+See NOTICE and vendor/*/LICENSE files before redistribution.

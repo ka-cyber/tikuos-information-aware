@@ -1,0 +1,514 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_vfs_tree_data.c - /data VFS nodes (user data and persisted state).
+ *
+ * A dynamic directory backed by the Tiku File Store: files can be created,
+ * written, read, listed and deleted at run time.  The store rides the carved NVM
+ * region where there is one, a .persistent FRAM array on MSP430, else .bss.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include "tiku_vfs_tree_data.h"
+#include "tiku.h"
+
+/*
+ * The store is not a shell feature.
+ *
+ * The file has two halves.  Everything down to the DYNAMIC-DIRECTORY OPS
+ * banner -- the backing memory, the backend, the mount, and the
+ * tiku_vfs_tree_data_store() accessor -- is always compiled, because loadable
+ * modules and radio firmware are kernel-level tenants that must mount and read
+ * the store in a build with no shell at all.  The VFS presentation above it
+ * (the /data node, its dynamic ops, and the df snapshot) stays behind the shell
+ * gate: a namespace entry with no shell to type at it is genuinely shell-shaped.
+ */
+
+#include <string.h>
+
+#include "kernel/fs/tiku_tfs.h"
+#include <kernel/memory/tiku_mem.h>      /* tiku_mpu_(un)lock_nvm, tiku_tier_nvm_write */
+#include "kernel/memory/tiku_nvm_region.h"
+#include <kernel/memory/tiku_nvm_map.h>  /* TIKU_DEVICE_NVM_LABEL fallback */
+
+/*---------------------------------------------------------------------------*/
+/* NVM-BACKED FILE STORE FOR /data                                           */
+/*---------------------------------------------------------------------------*/
+
+/* The store's NVM home.  Ambiq: the FS extent of the carved NVM region (durable
+ * MRAM, read in place, written via the region backend) -- no SRAM array.
+ * RP2350: the FS extent of the carved Flash region (read in place via XIP,
+ * written via the Flash region backend).  nRF54L: the FS extent of the carved
+ * RRAM region (byte-writable NVM read in place, written via the region backend
+ * through the RRAMC WEN gate).  MSP430: a `.persistent` FRAM array (in place).
+ * Other parts: plain `.bss` (volatile) until a backend lands. */
+#if defined(PLATFORM_AMBIQ) || defined(PLATFORM_RP2350) || \
+    defined(PLATFORM_NORDIC) || defined(PLATFORM_STM32N6) || \
+    defined(PLATFORM_RA8P1)
+
+/*
+ * The fit/fill assertions that stood here are GONE, not relaxed.
+ *
+ * They existed because TIKU_TFS_MAX_FILES was a hand-tuned number that had to
+ * be kept in step with the extent by hand: one caught a store too big for its
+ * extent, the other a store that left more than a file's worth of it idle.
+ * Capacity is now derived from the extent at mount, so "too big" cannot be
+ * expressed and "leaves space idle" is false by construction -- the derivation
+ * returns the largest count that fits, and the host suite asserts that adding
+ * one more file would not.  What remains worth checking is the FLOOR, which
+ * mount enforces at runtime because only the linker knows the real carve.
+ */
+
+static tiku_tfs_t          data_fs;
+static tiku_nvm_backend_t  data_be;
+static uint8_t             data_fs_ready;
+
+/* Program through the region backend (MRAM bootrom); it brackets its own NVM
+ * window, so reads stay plain pointer derefs into the FS extent. */
+static int
+data_be_write(tiku_nvm_backend_t *be, size_t off, const void *src, size_t len)
+{
+    return (tiku_tier_nvm_write((uint8_t *)be->base + off, src, len)
+            == TIKU_MEM_OK) ? 0 : -1;
+}
+
+/**
+ * @brief Lazily mount the /data file store over the carved NVM region.
+ *
+ * Idempotent: returns immediately once mounted.  Locates the region backend
+ * (MRAM), places the FS extent above the tier extent, and mounts the TFS over
+ * it.
+ *
+ * @return 0 once the store is ready; -1 if the region is absent or too small
+ *         to hold the FS extent, or the TFS mount fails.
+ */
+static int
+data_tfs_ensure(void)
+{
+    const tiku_nvm_backend_t *rgn;
+
+    if (data_fs_ready) {
+        return 0;
+    }
+    rgn = tiku_nvm_backend_get();
+    if (rgn == NULL || rgn->base == NULL ||
+        rgn->size <= (size_t)TIKU_NVM_TIER_BYTES) {
+        return -1;
+    }
+    /* FS extent: EVERYTHING above the tier, measured from the region the linker
+     * actually carved rather than from a constant describing it.
+     *
+     * The old form anchored the store to the top of the region and took a
+     * compile-time length, so a carve that disagreed with the C mirror silently
+     * lost the difference -- the failure that left 676 KB idle on an nRF54LM20.
+     * Now the only fixed number is the tier, which IS a platform contract, and
+     * the store takes the remainder: a bigger carve becomes more files (the
+     * store derives its capacity from this size), and a smaller one is caught by
+     * the floor check inside the mount rather than by arithmetic here. */
+    data_be.base  = rgn->base + TIKU_NVM_TIER_BYTES;
+    data_be.size  = rgn->size - TIKU_NVM_TIER_BYTES;
+    data_be.write = data_be_write;
+    data_be.erase = NULL;
+    data_be.ctx   = NULL;
+    if (tiku_tfs_mount(&data_fs, &data_be) != TFS_OK) {
+        return -1;
+    }
+    data_fs_ready = 1;
+    return 0;
+}
+
+/**
+ * @brief Report how the carved region is divided, for `df`.
+ *
+ * The extents are compile-time constants and the region size is whatever the
+ * linker carved, so `df` publishes both plus their difference: `idle_bytes`
+ * must read 0, or TIKU_NVM_REGION_BYTES is out of step with the linker script.
+ *
+ * @param out  Snapshot to fill in (extent fields only).
+ */
+static void
+data_fill_extents(tiku_data_df_t *out)
+{
+    const tiku_nvm_backend_t *rgn = tiku_nvm_backend_get();
+
+    out->region_bytes = (rgn != NULL) ? (uint32_t)rgn->size : 0u;
+    out->tier_bytes   = (uint32_t)TIKU_NVM_TIER_BYTES;
+    out->fs_bytes     = (out->region_bytes > (uint32_t)TIKU_NVM_TIER_BYTES)
+                        ? (out->region_bytes - (uint32_t)TIKU_NVM_TIER_BYTES)
+                        : 0u;
+    /* Idle space is now STRUCTURALLY zero -- the two extents are the tier and
+     * "everything else", so they tile the carve by construction rather than by
+     * a table being kept in step.  The field stays because df prints it and a
+     * non-zero value would mean this arithmetic broke. */
+    out->idle_bytes   = 0u;
+}
+
+#else  /* MSP430 FRAM / host: a static backing array */
+
+#if defined(PLATFORM_MSP430)
+#define DATA_TFS_SECTION TIKU_DURABLE   /* FRAM-backed file store */
+#else
+#define DATA_TFS_SECTION                /* host: volatile test backing */
+#endif
+
+/*
+ * MSP430 and host have no carved extent to derive from -- the store's backing
+ * IS this array -- so here the geometry is stated rather than derived, and the
+ * array is sized from it.  Mount then derives the same count straight back,
+ * because TIKU_TFS_EXTENT_FOR_SLOTS is the exact inverse of the fit it does, so
+ * these platforms take the identical code path rather than a special case.
+ */
+#ifndef DATA_TFS_SLOTS
+#define DATA_TFS_SLOTS  TIKU_TFS_MIN_SLOTS
+#endif
+static DATA_TFS_SECTION uint8_t
+    data_tfs_region[TIKU_TFS_EXTENT_FOR_SLOTS(DATA_TFS_SLOTS)];
+static tiku_tfs_t          data_fs;
+static tiku_nvm_backend_t  data_be;
+static uint8_t             data_fs_ready;
+
+/**
+ * @brief NVM backend write callback for the /data file store (FRAM/host).
+ *
+ * Copies @p len bytes from @p src to offset @p off within the backing
+ * array, bracketing the copy in an MPU NVM-unlock window so the
+ * `.persistent` FRAM region is writable.
+ *
+ * @param be   Backend descriptor (its base is the store's backing array)
+ * @param off  Byte offset within the backing store
+ * @param src  Source bytes to program
+ * @param len  Number of bytes to write
+ * @return 0 always (the in-place copy cannot fail)
+ */
+static int
+data_be_write(tiku_nvm_backend_t *be, size_t off, const void *src, size_t len)
+{
+    uint16_t mpu = tiku_mpu_unlock_nvm();
+    memcpy(be->base + off, src, len);
+    tiku_mpu_lock_nvm(mpu);
+    return 0;
+}
+
+/**
+ * @brief Lazily mount the Tiku File Store backing /data (FRAM/host).
+ *
+ * Idempotent: returns immediately once mounted.  On first call it wires
+ * the NVM backend to the static backing array and mounts the store.
+ *
+ * @return 0 if the store is mounted (or already was), -1 on mount failure
+ */
+static int
+data_tfs_ensure(void)
+{
+    if (data_fs_ready) {
+        return 0;
+    }
+    data_be.base  = data_tfs_region;
+    data_be.size  = sizeof data_tfs_region;
+    data_be.write = data_be_write;
+    data_be.erase = NULL;
+    data_be.ctx   = NULL;
+    if (tiku_tfs_mount(&data_fs, &data_be) != TFS_OK) {
+        return -1;
+    }
+    data_fs_ready = 1;
+    return 0;
+}
+
+/**
+ * @brief Report the store's extent, for `df` (no carved region here).
+ *
+ * MSP430 and host builds size the backing array FROM the store's geometry, so
+ * the extent always fits exactly and there is no region to divide -- reporting
+ * a zero region tells `df` to omit the region breakdown entirely.
+ *
+ * @param out  Snapshot to fill in (extent fields only).
+ */
+static void
+data_fill_extents(tiku_data_df_t *out)
+{
+    out->region_bytes = 0u;
+    out->tier_bytes   = 0u;
+    out->fs_bytes     = (uint32_t)sizeof data_tfs_region;
+    out->idle_bytes   = 0u;
+}
+
+#endif
+
+/*===========================================================================*/
+/* VFS PRESENTATION -- shell-gated.  Everything ABOVE this line is the store   */
+/* itself and is always compiled; everything below turns it into a namespace   */
+/* entry, which is what needs a shell.                                        */
+/*
+ * NOTE ON THE TEST: `#if TIKU_SHELL_ENABLE`, on the VALUE, not
+ * `#if defined(TIKU_SHELL_ENABLE)`.  tiku.h defines the macro UNCONDITIONALLY
+ * (to 0 when the shell is off), so the `defined()` form is always true and
+ * gates nothing.  The rest of kernel/vfs/tree/ spells it this way too.
+ */
+/*===========================================================================*/
+#if TIKU_SHELL_ENABLE
+
+#if TIKU_SHELL_CMD_BASIC
+#include "kernel/shell/basic/tiku_basic.h"
+#endif
+
+/*---------------------------------------------------------------------------*/
+/* DYNAMIC-DIRECTORY OPS — bridge /data to the file store                     */
+/*---------------------------------------------------------------------------*/
+
+typedef struct { tiku_vfs_dyn_list_cb cb; void *ctx; } data_list_w_t;
+
+/**
+ * @brief File-store list adapter: forward each entry to the VFS callback.
+ *
+ * Bridges the tiku_tfs_list callback (name, len, ctx) to the VFS
+ * dynamic-list callback (name, ctx), discarding the length.
+ *
+ * @param name  File name reported by the store
+ * @param len   Entry length (unused)
+ * @param vw    Wrapper carrying the VFS callback and its context
+ */
+static void
+data_list_thunk(const char *name, size_t len, void *vw)
+{
+    data_list_w_t *w = (data_list_w_t *)vw;
+    (void)len;
+    w->cb(name, w->ctx);
+}
+
+/**
+ * @brief List op for the /data dynamic directory.
+ *
+ * Enumerates every file in the store, invoking @p cb once per name
+ * (via data_list_thunk).  No-op if the store fails to mount.
+ *
+ * @param cb   Per-entry callback
+ * @param ctx  Opaque context passed to @p cb
+ */
+static void
+data_dyn_list(tiku_vfs_dyn_list_cb cb, void *ctx)
+{
+    data_list_w_t w;
+    if (data_tfs_ensure() != 0) {
+        return;
+    }
+    w.cb = cb;
+    w.ctx = ctx;
+    (void)tiku_tfs_list(&data_fs, data_list_thunk, &w);
+}
+
+/**
+ * @brief Read op for /data/<name> dynamic files.
+ *
+ * Reads up to @p max bytes of file @p name from the store into @p buf.
+ *
+ * @param name  File name under /data
+ * @param buf   Output buffer
+ * @param max   Capacity of @p buf
+ * @return Bytes read, or -1 if the store is unmounted or the file is absent
+ */
+static int
+data_dyn_read(const char *name, char *buf, size_t max)
+{
+    size_t n = 0;
+    if (data_tfs_ensure() != 0) {
+        return -1;
+    }
+    if (tiku_tfs_read(&data_fs, name, buf, max, &n) != TFS_OK) {
+        return -1;
+    }
+    return (int)n;
+}
+
+/**
+ * @brief Write op for /data/<name> dynamic files.
+ *
+ * Creates or overwrites file @p name in the store with @p len bytes
+ * from @p buf.
+ *
+ * @param name  File name under /data
+ * @param buf   Bytes to store
+ * @param len   Number of bytes
+ * @return 0 on success, -1 on mount failure or a full/failed store
+ */
+static int
+data_dyn_write(const char *name, const char *buf, size_t len)
+{
+    if (data_tfs_ensure() != 0) {
+        return -1;
+    }
+    return (tiku_tfs_write(&data_fs, name, buf, len) == TFS_OK) ? 0 : -1;
+}
+
+/**
+ * @brief Unlink op for /data/<name> dynamic files.
+ *
+ * Deletes file @p name from the store.
+ *
+ * @param name  File name under /data
+ * @return 0 on success, -1 on mount failure or if the file is absent
+ */
+static int
+data_dyn_unlink(const char *name)
+{
+    if (data_tfs_ensure() != 0) {
+        return -1;
+    }
+    return (tiku_tfs_delete(&data_fs, name) == TFS_OK) ? 0 : -1;
+}
+
+/* Folder-aware listing: present the flat store as a tree under @p prefix. */
+static void
+data_dyn_list_dir(const char *prefix, tiku_vfs_dyn_list_cb cb, void *ctx)
+{
+    data_list_w_t w;
+    if (data_tfs_ensure() != 0) {
+        return;
+    }
+    w.cb = cb;
+    w.ctx = ctx;
+    (void)tiku_tfs_list_dir(&data_fs, prefix, data_list_thunk, &w);
+}
+
+static const tiku_vfs_dynops_t data_dynops = {
+    data_dyn_list, data_dyn_read, data_dyn_write, data_dyn_unlink,
+    data_dyn_list_dir
+};
+
+/*---------------------------------------------------------------------------*/
+/* /data/basic — legacy BASIC program bridge (only when BASIC is built)      */
+/*---------------------------------------------------------------------------*/
+
+#if TIKU_SHELL_CMD_BASIC
+
+/**
+ * @brief Read handler for /data/basic (legacy BASIC program bridge).
+ *
+ * Renders the BASIC interpreter's current program store as text.
+ *
+ * @param buf  Output buffer
+ * @param max  Capacity of @p buf
+ * @return Bytes written (see tiku_basic_vfs_read)
+ */
+static int
+data_basic_read(char *buf, size_t max)
+{
+    return tiku_basic_vfs_read(buf, (unsigned int)max);
+}
+
+/**
+ * @brief Write handler for /data/basic (legacy BASIC program bridge).
+ *
+ * Loads @p len bytes of program text into the BASIC interpreter's store.
+ *
+ * @param buf  Program text
+ * @param len  Number of bytes
+ * @return 0 on success, negative on error (see tiku_basic_vfs_write)
+ */
+static int
+data_basic_write(const char *buf, size_t len)
+{
+    return tiku_basic_vfs_write(buf, (unsigned int)len);
+}
+
+static const tiku_vfs_node_t data_children[] = {
+    { "basic", TIKU_VFS_FILE, data_basic_read, data_basic_write, NULL, 0,
+      NULL, NULL, TIKU_VFS_CAP_FS },
+};
+
+static const tiku_vfs_node_t data_node = {
+    "data", TIKU_VFS_DIR, NULL, NULL,
+    data_children, (uint8_t)(sizeof(data_children) / sizeof(data_children[0])),
+    NULL, &data_dynops
+};
+
+#else  /* no BASIC: /data is purely the dynamic file store */
+
+static const tiku_vfs_node_t data_node = {
+    "data", TIKU_VFS_DIR, NULL, NULL,
+    NULL, 0,
+    NULL, &data_dynops
+};
+
+#endif
+
+/*---------------------------------------------------------------------------*/
+/* df SUPPORT — file-store usage stats                                       */
+/*---------------------------------------------------------------------------*/
+
+typedef struct { uint16_t files; uint32_t bytes; } data_df_acc_t;
+
+/**
+ * @brief File-store accumulator for df usage stats.
+ *
+ * Called once per file by tiku_vfs_tree_data_df(): increments the file
+ * count and adds the entry's byte length to the running total.
+ *
+ * @param name  File name (unused)
+ * @param len   File length in bytes, added to the accumulator
+ * @param vacc  Pointer to the data_df_acc_t accumulator
+ */
+static void
+data_df_thunk(const char *name, size_t len, void *vacc)
+{
+    data_df_acc_t *a = (data_df_acc_t *)vacc;
+    (void)name;
+    a->files++;
+    a->bytes += (uint32_t)len;
+}
+
+int
+tiku_vfs_tree_data_df(tiku_data_df_t *out)
+{
+    data_df_acc_t acc;
+
+    acc.files = 0u;
+    acc.bytes = 0u;
+    if (out == NULL || data_tfs_ensure() != 0) {
+        return -1;
+    }
+    (void)tiku_tfs_list(&data_fs, data_df_thunk, &acc);
+    out->used_files = acc.files;
+    out->used_bytes = acc.bytes;
+    out->max_files  = data_fs.nfiles;          /* derived at mount */
+    out->slot_bytes = (uint16_t)TIKU_TFS_SLOT_DATA;
+    out->cap_bytes  = (uint32_t)data_fs.nfiles * (uint32_t)TIKU_TFS_SLOT_DATA;
+    /* One source of truth for what to CALL the NVM: the device header's
+     * TIKU_DEVICE_NVM_LABEL (FRAM / RRAM / MRAM / Flash), never a per-platform
+     * ladder here -- a second copy is exactly how the two drift apart. */
+    out->backing = TIKU_DEVICE_NVM_LABEL;
+    data_fill_extents(out);
+    return 0;
+}
+
+/*---------------------------------------------------------------------------*/
+/* PUBLIC                                                                     */
+/*---------------------------------------------------------------------------*/
+
+const tiku_vfs_node_t *
+tiku_vfs_tree_data_get(void)
+{
+    return &data_node;
+}
+
+#endif /* TIKU_SHELL_ENABLE -- VFS presentation ends here */
+
+tiku_tfs_t *
+tiku_vfs_tree_data_store(void)
+{
+    /* Same lazy mount the VFS nodes use; callers that want whole objects
+     * (tiku_blob) work against the store rather than through path reads. */
+    if (data_tfs_ensure() != 0) {
+        return NULL;
+    }
+    return &data_fs;
+}

@@ -1,0 +1,157 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * main.c - Main application entry point
+ *
+ * System initialization and main event loop for the Tiku Operating System.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include "tiku.h"
+#include "boot/tiku_boot.h"
+#include "kernel/scheduler/tiku_sched.h"
+
+#if TEST_ENABLE
+#include "tests/test_runner.h"
+#endif
+
+#if defined(HAS_TIKUKITS) && defined(HAS_EXAMPLES)
+#include "examples/kits/example_kits_runner.h"
+#endif
+
+#include "kernel/vfs/tiku_vfs_tree.h"
+
+#if TIKU_SHELL_ENABLE
+#include "kernel/shell/tiku_shell.h"
+#endif
+
+#if TIKU_INIT_ENABLE
+#include "kernel/memory/tiku_nvm_map.h"
+#include "kernel/init/tiku_init.h"
+#endif
+
+#ifdef TIKU_BASIC_EMBEDDED
+#include "kernel/shell/basic/tiku_basic.h"
+extern const char tiku_basic_embedded_src[];
+#endif
+
+/*---------------------------------------------------------------------------*/
+/* PUBLIC FUNCTIONS                                                          */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Main application entry point
+ * @return Should never return (infinite loop)
+ *
+ * Initializes the system hardware, optionally runs the test suite
+ * when TEST_ENABLE is set, then enters the main application loop.
+ */
+int main(void) {
+  int ret;
+
+  /* Step 1: Disable watchdog immediately (before any other init) */
+  tiku_watchdog_off();
+
+  /* Step 2: Full system boot sequence
+   *   - CPU frequency configuration
+   *   - UART init (enables printf under GCC; no-op under CCS)
+   *   - Clock initialization
+   *   - Process subsystem, hardware timer, software timers (via scheduler)
+   */
+  ret = tiku_cpu_full_init(MAIN_CPU_FREQ);
+  if (ret != TIKU_BOOT_SUCCESS) {
+    MAIN_PRINTF("ERROR: Boot failed at stage %d\n", ret);
+    while (1) { /* halt */ }
+  }
+
+  MAIN_PRINTF("TikuOS starting up...\n");
+
+  MAIN_PRINTF("Boot complete\n");
+
+#if defined(TIKU_POWER_AUTORUN) && TIKU_POWER_AUTORUN
+  /* Deep-sleep measurement firmware: run the console-free power staircase
+   * instead of the scheduler (see tiku_ambiq_power_autorun).  Never returns. */
+  {
+    extern void tiku_ambiq_power_autorun(void);
+    MAIN_PRINTF("POWER AUTORUN: spin3s / idle10s / deepsleep45s, forever.\n");
+    MAIN_PRINTF("Unplug J16 (J-Link) and power via the Apollo5 USB connector\n");
+    MAIN_PRINTF("for the real deep-sleep measurement; reconnect J16 to flash.\n");
+    tiku_ambiq_power_autorun();
+  }
+#endif
+
+#if TIKU_TURBO_BENCH
+  /* Frequency-scaling benchmark firmware: run heavy TikuKits workloads at
+   * 96 MHz (LP) and 192 MHz (HP), emit serial markers for host-side timing,
+   * then halt (never reaches the shell/scheduler). */
+  {
+    extern void turbo_bench_run(void);
+    turbo_bench_run();
+  }
+  for (;;) { /* benchmark complete -- halt */ }
+#endif
+
+#if TIKU_SHELL_ENABLE
+  tiku_shell_init();
+#endif
+
+#ifdef TIKU_BASIC_EMBEDDED
+  /* Build-time-embedded BASIC program: parse + RUN before anything
+   * else. Returns when the program ends (END / STOP / fall-off);
+   * the scheduler then takes over and -- if the shell is enabled
+   * -- the user gets a regular shell prompt. */
+  tiku_basic_run_source(tiku_basic_embedded_src);
+#endif
+
+#if TIKU_INIT_ENABLE
+  /* Load only.  Execution happens in the shell process's first schedule
+   * (tiku_shell.c): the parser's command table and the console backend are
+   * process-startup state, so an entry dispatched from here hits a NULL
+   * table and silently does nothing -- five bus-touching entries once
+   * echoed at boot with no effect, no output, and no error.  Running from
+   * the shell also puts entries after the driver registry and the VFS
+   * tree, so they behave exactly like typed commands. */
+  tiku_nvm_map_init();
+  tiku_init_load();
+#endif
+
+  /* Initialize the VFS tree.  (/proc rebuilds its node table on every
+   * lookup, so process-registration order does not matter to it.) */
+  tiku_vfs_tree_init();
+
+  /* Hand off to the driver registry. With HAS_DRIVERS=0 the table
+   * is empty and this is a no-op; with a populated drivers/ tree
+   * each enabled driver's init() runs here. See drivers.md. */
+  {
+    extern void tiku_drv_init_all(void);
+    tiku_drv_init_all();
+  }
+
+#if TEST_ENABLE
+  test_run_all();
+#endif
+
+#if defined(HAS_TIKUKITS) && defined(HAS_EXAMPLES) && TIKU_EXAMPLES_ENABLE
+  example_kits_run();
+#endif
+
+#if TIKU_APPS_ENABLE
+  MAIN_PRINTF("App mode active\n");
+#endif
+
+  /* Step 3: Enter the scheduler loop (dispatches events, runs protothreads) */
+  MAIN_PRINTF("Entering scheduler\n");
+  tiku_sched_loop();
+
+  /* Should never reach here */
+  return 0;
+}

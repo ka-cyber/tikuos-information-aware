@@ -1,0 +1,221 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_crt_early_apollo4l.c - Apollo4 Lite (Cortex-M4F) startup.
+ *
+ * Mirrors the Apollo510 startup for ARMv7E-M: single-precision FPU, no Helium or
+ * low-overhead branch, and 84 external IRQs.  The part is not secure, so the boot
+ * ROM hands control to the vector table the standard Cortex-M way.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <stdint.h>
+#include "apollo4l.h"   /* PWRCTRL (shared-SRAM power-enable) -- register header only */
+
+/*---------------------------------------------------------------------------*/
+/* Linker-script symbols                                                     */
+/*---------------------------------------------------------------------------*/
+
+extern uint32_t __data_load;
+extern uint32_t __data_start;
+extern uint32_t __data_end;
+extern uint32_t __bss_start;
+extern uint32_t __bss_end;
+extern uint32_t __ssram_start;
+extern uint32_t __ssram_end;
+extern uint32_t __stack;
+
+/*---------------------------------------------------------------------------*/
+/* External entry points                                                     */
+/*---------------------------------------------------------------------------*/
+
+extern int  main(void);
+
+/* Forward decl of the vector table (defined below). Apollo4 Lite has 84
+ * external IRQs (0..83, see apollo4l.h IRQn_Type, MAX_IRQn = 84). */
+typedef void (*ambiq_isr_t)(void);
+#define AMBIQ_NUM_EXT_IRQS  84
+extern const ambiq_isr_t tiku_ambiq_vectors[16 + AMBIQ_NUM_EXT_IRQS];
+
+/*---------------------------------------------------------------------------*/
+/* Default + weak handlers (override with a same-named non-weak symbol)       */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Default (catch-all) exception and IRQ handler -- spins on WFE so a
+ *        debugger halt lands somewhere recognisable.
+ */
+static void ambiq_default_handler(void) {
+    while (1) {
+        __asm__ volatile ("wfe");
+    }
+}
+
+/** @brief NMI handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_nmi_handler(void)          __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief HardFault handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_hard_fault_handler(void)   __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief MemManage fault handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_mem_fault_handler(void)    __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief BusFault handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_bus_fault_handler(void)    __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief UsageFault handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_usage_fault_handler(void)  __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief SVC handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_svc_handler(void)          __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief PendSV handler -- weak alias to ambiq_default_handler */
+void tiku_ambiq_pendsv_handler(void)       __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief SysTick handler -- weak; the timer arch provides the real one */
+void tiku_ambiq_systick_handler(void)      __attribute__((weak, alias("ambiq_default_handler")));
+
+/* Peripheral IRQs the arch drivers claim (apollo4l IRQ map). The driver that
+ * handles each one provides a strong definition of the same symbol. */
+/** @brief UART2 console ISR (IRQ 17) -- weak alias */
+void tiku_ambiq_uart2_isr(void)            __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief STIMER Compare0 ISR (IRQ 32, htimer source) -- weak alias */
+void tiku_ambiq_stimer_cmpr0_isr(void)     __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief STIMER Compare1 ISR (IRQ 33, kernel tick) -- weak alias */
+void tiku_ambiq_stimer_cmpr1_isr(void)     __attribute__((weak, alias("ambiq_default_handler")));
+/** @brief GPIO0 pins0-31 ISR (IRQ 56) -- weak alias */
+void tiku_ambiq_gpio0_isr(void)            __attribute__((weak, alias("ambiq_default_handler")));
+
+/*---------------------------------------------------------------------------*/
+/* Reset handler                                                             */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Apollo4 Lite (Cortex-M4F) reset handler -- bare-metal startup entry
+ *
+ * Executed immediately after the boot ROM transfers control.  Unlike the M55
+ * startup there is no EPU power-state, no Low-Overhead-Branch and no
+ * SecureFault.
+ *
+ * @note The shared SRAM banks are powered on here when the build places statics
+ *       in .ssram; the minimal/smoke build keeps .ssram empty and leaves SSRAM
+ *       unpowered.
+ */
+void tiku_ambiq_reset_handler(void) __attribute__((naked, section(".text"), used));
+
+void tiku_ambiq_reset_handler(void) {
+    /* Mask maskable IRQs immediately; the scheduler re-enables them at the top
+     * of tiku_sched_loop(). */
+    __asm__ volatile ("cpsid i" ::: "memory");
+
+    /* Set SP explicitly so this handler is robust to alternate entry paths. */
+    __asm__ volatile ("ldr sp, =__stack");
+
+    /* Point VTOR at this table (512-aligned at MRAM origin 0x18000). */
+    *(volatile uint32_t *)0xE000ED08U = (uint32_t)tiku_ambiq_vectors;
+
+    /* Enable the FPU: CPACR grants full access to CP10/CP11. Required because
+     * the build uses -mfloat-abi=hard. */
+    *(volatile uint32_t *)0xE000ED88U |= (0xFU << 20);
+    __asm__ volatile ("dsb");
+    __asm__ volatile ("isb");
+
+    /* Copy .data from its MRAM load address to TCM. */
+    uint32_t *src = &__data_load;
+    uint32_t *dst = &__data_start;
+    while (dst < &__data_end) {
+        *dst++ = *src++;
+    }
+
+    /* Zero .bss. (.uninit is intentionally left untouched.) */
+    dst = &__bss_start;
+    while (dst < &__bss_end) {
+        *dst++ = 0U;
+    }
+
+    /* Power up the shared SRAM before touching .ssram. Apollo4 Lite has two
+     * 1 MB SSRAM groups; the SBL may leave them off, so enable both
+     * (PWRENSSRAM = ALL = 0x3) and bound-wait on SSRAMPWRST so a stuck power
+     * FSM can't hang the boot. Done only when the build actually places statics
+     * in .ssram (the SRAM tier's backing pool) -- the minimal/smoke build keeps
+     * .ssram empty and stays low-power. The cache is still off here, so this
+     * write and the zero-init below reach SSRAM directly. Mirrors the apollo510
+     * sequence (tiku_crt_early.c), which powers three groups. */
+    if (&__ssram_start < &__ssram_end) {
+        PWRCTRL->SSRAMPWREN_b.PWRENSSRAM = 0x3u;   /* both 1 MB groups */
+        {
+            uint32_t guard = 1000000u;
+            while ((PWRCTRL->SSRAMPWRST_b.SSRAMPWRST != 0x3u) && --guard) {
+            }
+        }
+    }
+
+    /* Zero the SSRAM-resident static buffers (.ssram). Empty in the minimal
+     * build (loop is a no-op); powered just above in the full build. */
+    dst = &__ssram_start;
+    while (dst < &__ssram_end) {
+        *dst++ = 0U;
+    }
+
+    (void)main();
+
+    /* Should never return. */
+    while (1) {
+        __asm__ volatile ("wfe");
+    }
+}
+
+/*---------------------------------------------------------------------------*/
+/* Vector table                                                              */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Apollo4 Lite interrupt vector table
+ *
+ * 16 system exceptions + 84 external IRQs = 100 entries, placed in .vectors at
+ * MRAM origin (0x18000), satisfying the 512-byte VTOR alignment.  All external
+ * slots default to ambiq_default_handler at this milestone.
+ *
+ * @note The full-kernel build adds named driver slots (UART2, STIMER, GPIO)
+ *       with the apollo4l IRQ numbers.
+ */
+const ambiq_isr_t tiku_ambiq_vectors[16 + AMBIQ_NUM_EXT_IRQS]
+__attribute__((section(".vectors"), used)) = {
+    /* System exceptions ------------------------------------------------ */
+    (ambiq_isr_t)(&__stack),            /*  0  Initial SP        */
+    tiku_ambiq_reset_handler,           /*  1  Reset             */
+    tiku_ambiq_nmi_handler,             /*  2  NMI               */
+    tiku_ambiq_hard_fault_handler,      /*  3  HardFault         */
+    tiku_ambiq_mem_fault_handler,       /*  4  MemManage         */
+    tiku_ambiq_bus_fault_handler,       /*  5  BusFault          */
+    tiku_ambiq_usage_fault_handler,     /*  6  UsageFault        */
+    ambiq_default_handler,              /*  7  Reserved (no v8M SecureFault) */
+    ambiq_default_handler,              /*  8  Reserved          */
+    ambiq_default_handler,              /*  9  Reserved          */
+    ambiq_default_handler,              /* 10  Reserved          */
+    tiku_ambiq_svc_handler,             /* 11  SVC               */
+    ambiq_default_handler,              /* 12  DebugMon          */
+    ambiq_default_handler,              /* 13  Reserved          */
+    tiku_ambiq_pendsv_handler,          /* 14  PendSV            */
+    tiku_ambiq_systick_handler,         /* 15  SysTick           */
+
+    /* External interrupts (apollo4l IRQn numbering) -------------------- */
+    [16 + 32] = tiku_ambiq_stimer_cmpr0_isr, /* IRQ 32  STIMER Compare0  */
+    [16 + 33] = tiku_ambiq_stimer_cmpr1_isr, /* IRQ 33  STIMER Compare1 (tick) */
+    [16 + 56] = tiku_ambiq_gpio0_isr,        /* IRQ 56  GPIO0 pins0-31   */
+
+    /* Everything else spins in the default handler. */
+    [16 +  0 ... 16 + 16] = ambiq_default_handler,
+    [16 + 18 ... 16 + 31] = ambiq_default_handler,
+    [16 + 34 ... 16 + 55] = ambiq_default_handler,
+    [16 + 57 ... 16 + AMBIQ_NUM_EXT_IRQS - 1] = ambiq_default_handler,
+
+    /* Console UART ISR LAST so it overrides the default-fill ranges above: the
+     * UART0 slot (IRQ15, Apollo4 Plus) falls INSIDE [16+0..16+16], and in a
+     * designated initializer the later entry wins.  (apollo4l's IRQ17 is outside
+     * the ranges, so its position did not matter.)  Binding the slot to the real
+     * ISR also keeps it from --gc-sections. */
+#if defined(TIKU_CONSOLE_UART0)
+    [16 + 15] = tiku_ambiq_uart2_isr,        /* IRQ 15  UART0 (Apollo4 Plus EVB) */
+#else
+    [16 + 17] = tiku_ambiq_uart2_isr,        /* IRQ 17  UART2 (Apollo4 Lite EVB) */
+#endif
+};

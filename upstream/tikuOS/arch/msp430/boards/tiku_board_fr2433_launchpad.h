@@ -1,0 +1,75 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_board_fr2433_launchpad.h - MSP430FR2433 LaunchPad board definitions.
+ *
+ * PCB-level GPIO assignments for the MSP-EXP430FR2433: LEDs, buttons and other
+ * board peripherals, per the TI schematic.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_BOARD_FR2433_LAUNCHPAD_H_
+#define TIKU_BOARD_FR2433_LAUNCHPAD_H_
+
+/*---------------------------------------------------------------------------*/
+/* BOARD IDENTIFICATION                                                      */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_NAME             "MSP430FR2433 LaunchPad"
+
+/*---------------------------------------------------------------------------*/
+/* LED COUNT                                                                 */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_LED_COUNT        2
+
+/*---------------------------------------------------------------------------*/
+/* LED1 (Green) - P1.0                                                       */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_LED1_INIT()      do { P1DIR |= BIT0; P1OUT &= ~BIT0; } while(0)
+#define TIKU_BOARD_LED1_ON()        do { P1OUT |= BIT0; } while(0)
+#define TIKU_BOARD_LED1_OFF()       do { P1OUT &= ~BIT0; } while(0)
+#define TIKU_BOARD_LED1_TOGGLE()    do { P1OUT ^= BIT0; } while(0)
+
+/*---------------------------------------------------------------------------*/
+/* LED2 (Green) - P1.1                                                       */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_LED2_INIT()      do { P1DIR |= BIT1; P1OUT &= ~BIT1; } while(0)
+#define TIKU_BOARD_LED2_ON()        do { P1OUT |= BIT1; } while(0)
+#define TIKU_BOARD_LED2_OFF()       do { P1OUT &= ~BIT1; } while(0)
+#define TIKU_BOARD_LED2_TOGGLE()    do { P1OUT ^= BIT1; } while(0)
+
+/*---------------------------------------------------------------------------*/
+/* Backchannel UART - TXD P1.4, RXD P1.5                                    */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_UART_PINS_INIT() do { P1SEL0 |= BIT4 | BIT5; P1SEL1 &= ~(BIT4 | BIT5); } while(0)
+
+/** UART baud-rate config: 9600 baud from 5 MHz MODCLK (MODOSC, ±0.5%).
+ *  N = 5000000/9600 = 520.83 → oversampling: BRW=32, BRF=9, BRS=0x00. */
+#define TIKU_BOARD_UART_CLK_SEL     UCSSEL__MODCLK
+#define TIKU_BOARD_UART_BRW         32
+#define TIKU_BOARD_UART_MCTLW       (UCOS16 | (0x09 << 4))
+
+/*---------------------------------------------------------------------------*/
+/* Button S1 - P2.3 (Active low)                                             */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_BTN1_INIT()      do { P2DIR &= ~BIT3; P2REN |= BIT3; P2OUT |= BIT3; } while(0)
+#define TIKU_BOARD_BTN1_PRESSED()   (!(P2IN & BIT3))
+
+/*---------------------------------------------------------------------------*/
+/* Button S2 - Not available on MSP-EXP430FR2433                             */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_BOARD_BTN2_INIT()      do { } while(0)
+#define TIKU_BOARD_BTN2_PRESSED()   (0)
+
+#endif /* TIKU_BOARD_FR2433_LAUNCHPAD_H_ */

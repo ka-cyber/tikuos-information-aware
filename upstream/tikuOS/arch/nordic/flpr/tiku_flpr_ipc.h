@@ -1,0 +1,282 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_flpr_ipc.h - shared-memory layout between the M33 app core and FLPR.
+ *
+ * Included by both the arm-none-eabi and riscv-none-elf builds, so it stays plain
+ * C99 plus <stdint.h>.  The shared page is the last kilobyte of the FLPR SRAM
+ * carve; the layout contract is below.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/*
+ * Layout contract (see also the app linker script and tiku_flpr.ld):
+ *   0x2003C000  FLPR .text/.rodata/.data/.bss   (image, loader-placed)
+ *   ...         FLPR stack (grows down from the shared page)
+ *   0x2003FC00  tiku_flpr_shared_t              (this header)
+ *
+ * SRAM is uncached for both masters, so `volatile` plus
+ * write-payload-then-flag ordering is the whole coherency story.
+ */
+
+
+#ifndef TIKU_FLPR_IPC_H_
+#define TIKU_FLPR_IPC_H_
+
+#include <stdint.h>
+
+/* Carve geometry -- single source of truth for both linker scripts and the
+ * loader.  Keep in sync with the MEMORY regions in nrf54l15.ld (app) and
+ * tiku_flpr.ld (coprocessor). */
+#define TIKU_FLPR_RAM_BASE   0x2003C000u
+#define TIKU_FLPR_RAM_SIZE   0x4000u                     /* 16 KB carve    */
+#define TIKU_FLPR_SHARED_ADDR (TIKU_FLPR_RAM_BASE + TIKU_FLPR_RAM_SIZE \
+                               - 0x400u)                 /* top 1 KB       */
+
+/* The FLPR firmware bumps .magic to this value as its very first act in
+ * main(), so the app can tell "started and running C code" from "started
+ * but wedged in the crt".  The heartbeat then proves steady-state life. */
+#define TIKU_FLPR_MAGIC      0x464C5052u                 /* 'FLPR'         */
+/* Published by the trap handler instead of the boot magic: the payload has
+ * faulted, recorded why, and is waiting for CMD_RESTART. */
+#define TIKU_FLPR_MAGIC_FAULT 0x464C5021u                /* 'FLP!'         */
+
+/* Single-slot message mailboxes, one per direction.  Sender fills buf/len
+ * then bumps seq (release order by construction on this uncached SRAM);
+ * receiver notices the seq change.  A slot is overwritten by the next
+ * message -- flow control is the consumer's job (echo-style protocols are
+ * naturally lock-step).  240 B fits BLE-PDU-class payloads and keeps the
+ * whole page comfortably inside 1 KB. */
+#define TIKU_FLPR_MSG_CAP  240u
+
+/* Data Length Extension: the max LL data-PDU payload negotiated (Phase F1).
+ * 80 comfortably fits the largest L2CAP PDU (the 69-byte SMP Public Key, the
+ * 68-byte long-read response) in a SINGLE LL PDU -- no fragmentation -- while
+ * an 80-byte-payload packet stays ~728 us on 1M PHY, inside the connection
+ * event's existing ~900 us TX/RX window (no timing re-tune).  Bounds the RADIO
+ * MAXLEN + the conn RX/TX buffers below. */
+#define TIKU_FLPR_DLE_MAX_OCTETS  80u
+/* Max air time for that payload, us: (octets + 14) * 8 on 1M PHY (preamble 1 +
+ * AA 4 + header 2 + MIC 4 + CRC 3 = 14).  Matches the spec's 2120 us @ 251. */
+#define TIKU_FLPR_DLE_MAX_TIME    ((TIKU_FLPR_DLE_MAX_OCTETS + 14u) * 8u)
+/* Buffer that holds a whole radio packet: S0 + LENGTH + S1 + payload(<=MAXLEN)
+ * + slack, word-aligned. */
+#define TIKU_FLPR_DLE_BUF_SIZE    96u
+
+typedef struct {
+    volatile uint32_t magic;        /* TIKU_FLPR_MAGIC once main() runs   */
+    volatile uint32_t heartbeat;    /* increments while un-parked          */
+    volatile uint32_t cmd;          /* app -> flpr command word            */
+    volatile uint32_t rsp;          /* flpr -> app response word           */
+
+    /* app -> flpr mailbox */
+    volatile uint32_t a2f_seq;
+    volatile uint32_t a2f_len;
+    volatile uint8_t  a2f_buf[TIKU_FLPR_MSG_CAP];
+
+    /* flpr -> app mailbox (doorbell: VPR EVENTS_TRIGGERED[0] -> IRQ 76) */
+    volatile uint32_t f2a_seq;
+    volatile uint32_t f2a_len;
+    volatile uint8_t  f2a_buf[TIKU_FLPR_MSG_CAP];
+
+    /* Beacon-offload telemetry (F4). */
+    volatile uint32_t beacon_bursts;
+
+    /* Fault record, written by the trap handler before the fault park.
+     * fault_count survives restarts within one launch; the cause and epc
+     * describe the most recent trap only. */
+    volatile uint32_t fault_count;
+    volatile uint32_t fault_cause;      /* mcause                          */
+    volatile uint32_t fault_epc;        /* mepc                            */
+
+    /* Connection controller (L6).  RX-probe (F-L6.1 step 0) proves the
+     * FLPR can drive RADIO *RX* (the beacon is TX-only): listen on the adv
+     * channel and report what address-matched / CRC-passed, plus the head
+     * of the first CRC-valid packet.  rx_done flips 0->1 when finished. */
+    volatile uint32_t rx_addr_evts;     /* ADDRESS matches in the window   */
+    volatile uint32_t rx_crcok_evts;    /* CRC-valid packets               */
+    volatile uint32_t rx_done;          /* probe finished                  */
+    volatile uint8_t  rx_first[16];     /* head of 1st CRC-valid packet    */
+    volatile uint32_t rx_first_len;
+
+    /* Connection state (F-L6.1 step 1).  The FLPR advertises connectably,
+     * captures the CONNECT_IND, and (step 1b) holds the link.  conn_state:
+     * 0 idle/advertising, 1 connected, 2 gave up (no central).  The rest
+     * are the parsed CONNECT_IND LLData the M33 reads back to verify. */
+    volatile uint32_t conn_state;
+    volatile uint32_t conn_aa;
+    volatile uint32_t conn_crcinit;
+    volatile uint32_t conn_events;      /* connection events run (step 1b) */
+    volatile uint16_t conn_interval;    /* 1.25 ms units                   */
+    volatile uint16_t conn_timeout;     /* 10 ms units                     */
+    volatile uint16_t conn_winoffset;
+    volatile uint8_t  conn_hop;
+    volatile uint8_t  conn_winsize;
+    volatile uint8_t  conn_chm[5];
+    /* Peer identity captured from the CONNECT_IND (Phase E / SMP): the SMP
+     * f5/f6 key derivation binds the LTK to both device addresses.  InitA is
+     * the central (initiator, address A); AdvA is local (peripheral, responder,
+     * address B) -- echoed so the host needn't remember what it advertised.
+     * conn_addr_types: bit0 = InitA type, bit1 = AdvA type (1 = random). */
+    volatile uint8_t  conn_inita[6];    /* initiator (central) address = A  */
+    volatile uint8_t  conn_adva[6];     /* advertiser (local) address   = B  */
+    volatile uint8_t  conn_addr_types;  /* bit0 InitA, bit1 AdvA (1=random)  */
+
+    /* LL encryption startup (Phase E3).  The FLPR has no AES, so the session
+     * key is derived on the M33 (SK = e(LTK, SKD) via CRACEN).  On LL_ENC_REQ
+     * the FLPR publishes the central's SKDm/IVm and bumps enc_req_seq; the M33
+     * host generates SKDs/IVs, computes SK+IV, and bumps enc_rsp_seq.  The FLPR
+     * then sends LL_ENC_RSP(SKDs,IVs) and (E3c) programs CCM00 with sk/iv. */
+    volatile uint32_t enc_req_seq;      /* FLPR: LL_ENC_REQ seen (params set) */
+    volatile uint32_t enc_rsp_seq;      /* M33: SKDs/IVs/sk/iv ready          */
+    volatile uint8_t  enc_skdm[8];      /* FLPR->M33: central's SKD (LSO)     */
+    volatile uint8_t  enc_ivm[4];       /* FLPR->M33: central's IV (LSO)      */
+    volatile uint8_t  enc_skds[8];      /* M33->FLPR: local SKD (MSO)         */
+    volatile uint8_t  enc_ivs[4];       /* M33->FLPR: local IV (MSO)          */
+    volatile uint8_t  enc_sk[16];       /* M33->FLPR: session key (CCM00)     */
+    volatile uint8_t  enc_iv[8];        /* M33->FLPR: IV = IVm||IVs (CCM00)   */
+    volatile uint32_t enc_on;           /* FLPR: 1 once encryption is active  */
+
+    /* Data Length Extension (Phase F1): once the FLPR answers LL_LENGTH_REQ it
+     * publishes the negotiated max LL payload here so the M33 host raises its
+     * L2CAP fragmentation threshold to match (0 = pre-DLE default, 27). */
+    volatile uint32_t dle_max;          /* FLPR->M33: negotiated max octets   */
+
+    /* PHY update (Phase F2).  The FLPR applies LL_PHY_UPDATE_IND at its Instant
+     * (reprogram RADIO MODE/PCNF0) and publishes the new PHY + the event count
+     * at which it switched, so the M33 can report survival on the new PHY. */
+    volatile uint32_t conn_phy;         /* current PHY: 0 1M, 1 2M, 2 Coded S8 */
+    volatile uint32_t conn_phy_evt;     /* conn_events value when PHY applied  */
+    /* F2 bisect telemetry (radioleft.md H1): did the FLPR's MODE write LATCH,
+     * and does its receiver see ANYTHING on the new PHY?  mode = RADIO->MODE
+     * read back right after the apply-block write (4 = 2M took); addr/crcok =
+     * EVENTS_ADDRESS / EVENTS_CRCOK counts observed AFTER the switch. */
+    volatile uint32_t conn_phy_mode;    /* FLPR: MODE readback at the switch   */
+    volatile uint32_t conn_phy_addr;    /* FLPR: post-switch ADDRESS events    */
+    volatile uint32_t conn_phy_crcok;   /* FLPR: post-switch CRCOK events      */
+    volatile uint32_t conn_sub;         /* vestigial (host tracks CCCD, PhaseB)*/
+    volatile uint32_t conn_gap;         /* anchored-RX: converged idle iters */
+    volatile uint32_t conn_rxon;        /* anchored-RX: last RX-on iters (s)  */
+    volatile uint32_t conn_cm;          /* Phase A: CHANNEL_MAP_UPDATEs applied*/
+    volatile uint32_t conn_cu;          /* Phase A: CONNECTION_UPDATEs applied */
+    volatile uint32_t a2f_ack;          /* Phase B: last a2f L2CAP fragment    */
+                                        /* the controller consumed for TX (==  */
+                                        /* a2f_seq means the slot is free)     */
+    volatile uint32_t f2a_llid;         /* Phase C: RX fragment boundary       */
+                                        /* (2 = start of L2CAP PDU, 1 = cont)  */
+    volatile uint32_t a2f_llid;         /* Phase C: TX fragment boundary       */
+    /* L2CAP transport (Phase B/C): while a connection is held the mailbox
+     * carries L2CAP FRAGMENTS ([{len}{CID}payload...] split across data PDUs),
+     * NOT NUS bytes.  RX: each received L2CAP data PDU -> f2a with f2a_llid
+     * (2 start / 1 continuation), doorbelled, for the M33 host to RECOMBINE
+     * and run ATT/GATT.  TX: the host's response/notification, fragmented, ->
+     * a2f with a2f_llid, flow-controlled via a2f_ack; the controller wraps
+     * each in a data PDU with that LLID.  The FLPR never parses ATT. */
+
+    /* Compute-only load (power characterisation).  The coprocessor's other
+     * sustained workloads are unusable as a POWER reference: the pulse engine
+     * drives VIO bit 7, which is DK LED3, so its current is mostly the LED, and
+     * the beacon/conn paths run the radio.  This one touches nothing outside
+     * the register file, so what it measures is the VPR core.  spin_passes is
+     * the WORK done -- current over a fixed window cannot tell "draws less"
+     * from "executed less" (see experiments/power/experiment1). */
+    volatile uint32_t spin_iters;       /* M33->FLPR: outer passes requested   */
+    volatile uint32_t spin_passes;      /* FLPR->M33: outer passes retired     */
+
+    /* Advertising telemetry.  A central that INITIATES answers an ADV_IND
+     * with a CONNECT_IND and never scans; a host stack DISCOVERING sends a
+     * SCAN_REQ first and expects a SCAN_RSP at T_IFS.  Counting the two
+     * apart is what tells an unanswered scan from a link that never came. */
+    volatile uint32_t adv_tx;           /* ADV_IND PDUs transmitted            */
+    volatile uint32_t adv_scanreq;      /* SCAN_REQs addressed to this AdvA    */
+    volatile uint32_t adv_scanrsp;      /* SCAN_RSPs transmitted in reply      */
+    volatile uint32_t adv_rxother;      /* other CRC-good PDUs in the window   */
+    volatile uint32_t adv_tifs;         /* last reply's ADDRESS, TIMER10 ticks */
+                                        /* since the request's end             */
+} tiku_flpr_shared_t;
+
+/* CMD_CONN_ADV input (in a2f_buf): connectable ADV PDU + the AdvA, and the
+ * SCAN_RSP to answer a SCAN_REQ with.  The response is its own PDU rather
+ * than a mirror of the advert because a scanner's duplicate filter drops a
+ * response that repeats the advert byte for byte; rsp_len 0 falls back to
+ * mirroring it. */
+typedef struct {
+    uint32_t adv_len;                   /* bytes in adv[] ([S0][LEN][S1]..) */
+    uint8_t  addr[6];                   /* AdvA to match in the CONNECT_IND */
+    uint8_t  adv[48];
+    uint32_t rsp_len;                   /* bytes in rsp[]; 0 = mirror adv   */
+    uint8_t  rsp[48];
+    uint32_t txen_ticks;                /* TIMER10 ticks from a SCAN_REQ's  */
+                                        /* end to the reply's TXEN; 0 =     */
+                                        /* the controller's own figure      */
+} tiku_flpr_conn_t;
+
+/* Cooperative park/resume protocol.  Hardware truths this encodes:
+ * clearing CPURUN does not halt a RUNNING VPR (boot-state control only),
+ * and re-setting it resumes at the CURRENT PC, not INITPC -- so a parked
+ * core must never have its image swapped underneath it.  Consequently the
+ * image loads ONCE per power-on; "stop" parks the firmware in a polling
+ * loop and "start" resumes it.  Runtime image replacement needs the
+ * resident-trampoline scheme (F5) and is out of scope here. */
+#define TIKU_FLPR_CMD_PARK    1u
+#define TIKU_FLPR_CMD_RESUME  2u
+/* Pulse engine (F3): parameters in a2f_buf as tiku_flpr_pulse_t; the
+ * firmware drives its VIO pin (bit 7 = P2.07 = LED3, routed by the app
+ * core via GPIO.PIN_CNF.CTRLSEL=VPR) for `edges` transitions with
+ * `half_cycles` FLPR cycles between them, then raises RSP_PULSE_DONE.
+ * 50 % duty by construction (every edge is a toggle). */
+#define TIKU_FLPR_CMD_PULSE   3u
+/* Beacon offload (F4): parameters in a2f_buf as tiku_flpr_beacon_t.  The
+ * firmware enters beacon mode -- one 3-channel BLE burst per interval,
+ * including the UARTE21 HF-clock kick -- until CMD_BEACON_STOP.  The app
+ * core prepares everything the firmware must not: radio link-config
+ * registers (while the RADIO is still secure), the SPU flips that make
+ * RADIO+UARTE21 reachable by this non-secure master, and the session
+ * CONSTLAT hold.  Burst count is published in .beacon_bursts. */
+#define TIKU_FLPR_CMD_BEACON      4u
+#define TIKU_FLPR_CMD_BEACON_STOP 5u
+/* RX probe (L6 F-L6.1 step 0): listen on the adv channel; results in the
+ * rx_* shared fields.  Link config (MODE/PCNF/adv-AA/CRC) is programmed by
+ * the M33 while RADIO is secure, then RADIO+UARTE21 are flipped NonSecure
+ * (same handoff as the beacon). */
+#define TIKU_FLPR_CMD_RXPROBE     6u
+/* Connection controller (L6 F-L6.1 step 1): advertise the connectable PDU
+ * in a2f_buf (tiku_flpr_conn_t), capture the CONNECT_IND, publish it in the
+ * conn_* fields (step 1a); step 1b then holds the link.  Same NS handoff. */
+#define TIKU_FLPR_CMD_CONN_ADV    7u
+#define TIKU_FLPR_CMD_CONN_STOP   8u
+/* Compute-only load (power characterisation): run .spin_iters outer passes of a
+ * register-only loop, publish the count in .spin_passes, then raise
+ * RSP_SPIN_DONE.  Deliberately touches no pin, no radio and no shared memory
+ * inside the loop, so the current it draws is the VPR core and nothing else.
+ * The M33 times it against its own clock -- the VPR's mcycle proved unusable as
+ * a timebase (see the pacing note in tiku_flpr_main.c). */
+#define TIKU_FLPR_CMD_SPIN        9u
+/* Leave the fault park: the trap handler re-enters _start, which re-runs the
+ * whole payload init.  Meaningful only while magic reads MAGIC_FAULT. */
+#define TIKU_FLPR_CMD_RESTART    10u
+#define TIKU_FLPR_RSP_PARKED  1u
+#define TIKU_FLPR_RSP_PULSE_DONE 2u
+#define TIKU_FLPR_RSP_BEACON_STOPPED 3u
+#define TIKU_FLPR_RSP_SPIN_DONE      4u
+
+typedef struct {
+    uint32_t half_cycles;           /* FLPR cycles per half-period (128/us) */
+    uint32_t edges;                 /* number of transitions to emit        */
+} tiku_flpr_pulse_t;
+
+typedef struct {
+    uint32_t interval_ms;
+    uint32_t pdu_len;
+    uint8_t  pdu[48];               /* [S0][LEN][S1][payload...] layout     */
+} tiku_flpr_beacon_t;
+
+#define TIKU_FLPR_VIO_BIT     7u    /* VIO bit 7 == P2.07 == DK LED3       */
+
+#define TIKU_FLPR_SHARED  ((tiku_flpr_shared_t *)TIKU_FLPR_SHARED_ADDR)
+
+#endif /* TIKU_FLPR_IPC_H_ */

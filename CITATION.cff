@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "Reproducible Information-Utility Scheduling on TikuOS"
+message: "Use this citation for the research artifact."
+authors:
+  - family-names: "Researcher"
+    given-names: "Artifact"
+version: "0.3.0"
+date-released: 2026-09-09
+license: "Apache-2.0"

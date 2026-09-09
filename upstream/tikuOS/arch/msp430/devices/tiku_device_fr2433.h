@@ -1,0 +1,122 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_device_fr2433.h - MSP430FR2433 silicon-level constants.
+ *
+ * GPIO ports, crystal support, memory sizes and peripheral availability; PCB-level
+ * pin assignments belong in the board header.  This part has no external crystals,
+ * three ports, an unprotected CS module and a different DCO layout.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_DEVICE_FR2433_H_
+#define TIKU_DEVICE_FR2433_H_
+
+/*---------------------------------------------------------------------------*/
+/* DEVICE IDENTIFICATION                                                     */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_DEVICE_NAME            "MSP430FR2433"
+#define TIKU_DEVICE_NVM_LABEL       "FRAM"   /**< NVM technology (UI label). */
+
+/*---------------------------------------------------------------------------*/
+/* GPIO PORT AVAILABILITY                                                    */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_DEVICE_HAS_PORT1       1
+#define TIKU_DEVICE_HAS_PORT2       1
+#define TIKU_DEVICE_HAS_PORT3       1
+#define TIKU_DEVICE_HAS_PORT4       0
+#define TIKU_DEVICE_HAS_PORT5       0
+#define TIKU_DEVICE_HAS_PORT6       0
+#define TIKU_DEVICE_HAS_PORT7       0
+#define TIKU_DEVICE_HAS_PORT8       0
+#define TIKU_DEVICE_HAS_PORT9       0
+#define TIKU_DEVICE_HAS_PORTJ       0
+
+/*---------------------------------------------------------------------------*/
+/* CRYSTAL OSCILLATOR AVAILABILITY                                           */
+/*---------------------------------------------------------------------------*/
+
+/** FR2433 has no external LFXT or HFXT crystal support */
+#define TIKU_DEVICE_HAS_LFXT        0
+#define TIKU_DEVICE_HAS_HFXT        0
+
+/*---------------------------------------------------------------------------*/
+/* CLOCK SYSTEM TYPE                                                         */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * The FR2433 clock system differs from the FR59xx CS_A: no password protection,
+ * DCO frequency through DCORSEL, MCLK and SMCLK sharing one source select, a
+ * one-bit ACLK select, and the dividers in a different register.
+ */
+#define TIKU_DEVICE_CS_HAS_KEY      0
+#define TIKU_DEVICE_CS_TYPE_FR2X33  1
+
+/*---------------------------------------------------------------------------*/
+/* CLOCK CAPABILITIES                                                        */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_DEVICE_MAX_STABLE_MHZ  16
+
+/*---------------------------------------------------------------------------*/
+/* MEMORY SIZES                                                              */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_DEVICE_FRAM_SIZE       (16 * 1024UL)   /* 16 KB FRAM (15.5 KB usable) */
+#define TIKU_DEVICE_RAM_SIZE        (4 * 1024UL)    /* 4 KB SRAM */
+#define TIKU_DEVICE_RAM_START       0x2000U         /* First byte of SRAM */
+
+/*---------------------------------------------------------------------------*/
+/* FRAM REGION SIZING (used by kernel/memory/tiku_fram_map)                  */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * Per-device sizing for FRAM-backed regions.  The kernel/memory/tiku_fram_map
+ * module reads these to declare storage arrays; the linker places them.
+ * Adjust sizes per device — the rest of the system adapts automatically.
+ */
+#define TIKU_DEVICE_FRAM_CONFIG_SIZE      512U    /* Init table + credentials */
+
+/* Future: loadable app slots (reserved IDs, not allocated until enabled) */
+#define TIKU_DEVICE_FRAM_APP_SLOT_SIZE    2048U   /* 2 KB per app slot */
+#define TIKU_DEVICE_FRAM_APP_SLOT_COUNT   2       /* 2 slots on 16 KB part */
+
+/*---------------------------------------------------------------------------*/
+/* FRAM ADDRESS RANGE                                                        */
+/*---------------------------------------------------------------------------*/
+
+#define TIKU_DEVICE_FRAM_START      0xC400U  /* First byte of main FRAM */
+#define TIKU_DEVICE_FRAM_END        0xFFFFU  /* Last byte of main FRAM */
+
+/*---------------------------------------------------------------------------*/
+/* MPU (MEMORY PROTECTION UNIT)                                              */
+/*---------------------------------------------------------------------------*/
+
+/** FR2433 has no hardware MPU — NVM writes need no unlock/lock */
+#define TIKU_DEVICE_HAS_MPU         0
+
+/*---------------------------------------------------------------------------*/
+/* FR2433 DCO RANGE SELECT VALUES                                            */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * The toolchain header defines DCORSEL_0 through DCORSEL_5.
+ * DCORSEL_6 (8 MHz) and DCORSEL_7 (16 MHz) are valid but not
+ * pre-defined in some header versions. Define them as fallbacks.
+ */
+#ifndef DCORSEL_6
+#define DCORSEL_6               (0x000C)    /* DCO range: 8 MHz nominal */
+#endif
+
+#ifndef DCORSEL_7
+#define DCORSEL_7               (0x000E)    /* DCO range: 16 MHz nominal */
+#endif
+
+#endif /* TIKU_DEVICE_FR2433_H_ */

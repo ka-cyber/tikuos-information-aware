@@ -1,0 +1,77 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_led.h - platform-independent LED interface.
+ *
+ * An indexed LED API sized by the board header's TIKU_BOARD_LED_COUNT.  Indices
+ * are zero-based: LED 0 maps to TIKU_BOARD_LED1_*, LED 1 to TIKU_BOARD_LED2_*,
+ * and so on.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_LED_H_
+#define TIKU_LED_H_
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include <stdint.h>
+#include "tiku.h"
+
+/*---------------------------------------------------------------------------*/
+/* DEFAULT LED COUNT                                                         */
+/*---------------------------------------------------------------------------*/
+
+#ifndef TIKU_BOARD_LED_COUNT
+#define TIKU_BOARD_LED_COUNT    0
+#endif
+
+/*---------------------------------------------------------------------------*/
+/* FUNCTION PROTOTYPES                                                       */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Return the number of LEDs available on this board.
+ * @return LED count defined by the board header.
+ */
+uint8_t tiku_led_count(void);
+
+/**
+ * @brief Initialize LED hardware for the given index.
+ * @param idx Zero-based LED index (0 .. TIKU_BOARD_LED_COUNT-1).
+ */
+void tiku_led_init(uint8_t idx);
+
+/**
+ * @brief Turn on the LED at the given index.
+ * @param idx Zero-based LED index.
+ */
+void tiku_led_on(uint8_t idx);
+
+/**
+ * @brief Turn off the LED at the given index.
+ * @param idx Zero-based LED index.
+ */
+void tiku_led_off(uint8_t idx);
+
+/**
+ * @brief Toggle the LED at the given index.
+ * @param idx Zero-based LED index.
+ */
+void tiku_led_toggle(uint8_t idx);
+
+/**
+ * @brief Initialize all board LEDs.
+ *
+ * Convenience wrapper — calls tiku_led_init() for every LED
+ * defined by TIKU_BOARD_LED_COUNT.
+ */
+void tiku_led_init_all(void);
+
+#endif /* TIKU_LED_H_ */

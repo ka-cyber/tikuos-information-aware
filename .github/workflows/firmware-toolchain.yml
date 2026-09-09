@@ -1,0 +1,14 @@
+name: firmware-toolchain
+on:
+  workflow_dispatch:
+# This workflow is intentionally a template. A real hardware/toolchain runner
+# must provide the vendor compiler; the repository never fabricates a firmware
+# build result when the toolchain is absent.
+jobs:
+  instructions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          echo "Install the board-specific TikuOS toolchain here."
+          echo "Then run the documented make command with TIKU_THREADS_ENABLE=1 TIKU_UTILITY_ENABLE=1."

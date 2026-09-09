@@ -1,0 +1,27 @@
+{
+  "artifact": "tikuos-information-aware",
+  "version": "0.3.0",
+  "source_inputs": {
+    "tikuOS-main.zip": "0642ed320167092d870776392f4e0b6406fea9a71f8c77419d1f5de0519cdfc7",
+    "pir_framework.zip": "dd30c2313902ed5c7a023218919ba103fa9443a34e72e9b9b3c57a733356b152",
+    "CardioFusion-AI-main.zip": "8c9c02da6be82afc53753b2116bb09a48d9286040a75cecb5aa5846df88ac84b",
+    "apc-rlnc-main (2).zip": "4d002122a66f32eb5199dd3e1c75ebe4bdd0d91f158fc169f52ae4291b63053f"
+  },
+  "upstream_snapshot": "upstream/tikuOS/ (exact supplied archive contents)",
+  "patch": "patches/0001-information-utility-scheduler.patch",
+  "validation": {
+    "pytest": "13 passed",
+    "patch": "PASS",
+    "tikuos_host_scheduler": "PASS",
+    "python_c_parity": "PASS",
+    "release_checks": "PASS"
+  },
+  "primary_experiment": {
+    "seeds": 24,
+    "regimes": 15,
+    "policies": 10,
+    "budget_cycles": 2400,
+    "primary_comparison": "utility_density - rr",
+    "controller_cycles_per_decision": 35
+  }
+}

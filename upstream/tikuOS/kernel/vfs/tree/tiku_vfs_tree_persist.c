@@ -1,0 +1,84 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_vfs_tree_persist.c - /sys/persist VFS nodes.
+ *
+ * Two read-only counters: how many magic-gated persist cells validated this boot,
+ * and how many had to be primed to defaults.  `primed` is the diagnostic -- 0 on
+ * an established device, so non-zero means NVM content was lost or moved.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include "tiku_vfs_tree_persist.h"
+#include "tiku.h"
+#include <kernel/memory/tiku_mem.h>
+#include <stdio.h>
+
+/*---------------------------------------------------------------------------*/
+/* /sys/persist/cells, /sys/persist/primed                                   */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Read handler for /sys/persist/cells.
+ *
+ * Renders the number of persist cells validated this boot ("4\n" with the
+ * stock tree).  tiku_persist_cell_count() counts cell_init() calls rather than
+ * a registry, so a cell whose init has not run yet does not appear.
+ *
+ * @param buf  Output buffer for the rendered text
+ * @param max  Capacity of @p buf in bytes
+ * @return Bytes written, or -1 on error
+ */
+static int
+persist_cells_read(char *buf, size_t max)
+{
+    return snprintf(buf, max, "%u\n",
+                    (unsigned)tiku_persist_cell_count());
+}
+
+/**
+ * @brief Read handler for /sys/persist/primed.
+ *
+ * Renders how many cells had to be primed to defaults this boot as
+ * a decimal line.  "0\n" is the healthy steady state; see the file
+ * header for what non-zero means.
+ *
+ * @param buf  Output buffer for the rendered text
+ * @param max  Capacity of @p buf in bytes
+ * @return Bytes written, or -1 on error
+ */
+static int
+persist_primed_read(char *buf, size_t max)
+{
+    return snprintf(buf, max, "%u\n",
+                    (unsigned)tiku_persist_cell_primed());
+}
+
+/*---------------------------------------------------------------------------*/
+/* NODE TABLE                                                                */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * /sys/persist directory table, exported so tiku_vfs_tree_sys.c can attach it
+ * as the "persist" directory; the entry count travels as
+ * TIKU_VFS_TREE_PERSIST_NCHILD (asserted below).  Both nodes are read-only --
+ * the counters are facts about this boot, not knobs.
+ */
+const tiku_vfs_node_t tiku_vfs_tree_persist_children[] = {
+    { "cells",  TIKU_VFS_FILE, persist_cells_read,  NULL, NULL, 0 },
+    { "primed", TIKU_VFS_FILE, persist_primed_read, NULL, NULL, 0 },
+};
+
+_Static_assert(sizeof(tiku_vfs_tree_persist_children) /
+               sizeof(tiku_vfs_tree_persist_children[0])
+               == TIKU_VFS_TREE_PERSIST_NCHILD,
+               "TIKU_VFS_TREE_PERSIST_NCHILD out of sync");

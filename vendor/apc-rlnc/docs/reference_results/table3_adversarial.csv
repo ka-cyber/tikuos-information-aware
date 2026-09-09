@@ -1,0 +1,4 @@
+scheme,pdr_pct,pdr_std_pct,latency_ms,latency_std_ms
+Random (no defense),88.24,2.1,221,24
+Static (no defense),89.67,1.9,209,22
+APC-RLNC (isolated),98.02,0.7,151,12

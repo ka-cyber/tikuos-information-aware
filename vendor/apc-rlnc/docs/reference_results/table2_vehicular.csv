@@ -1,0 +1,6 @@
+scheme,pdr_pct,pdr_std_pct,latency_ms,latency_std_ms,retention_pct
+Random,94.12,1.3,198,18,58.4
+Static,95.02,1.1,187,16,62.7
+PACE,96.18,0.9,178,14,68.1
+ARLNC,96.84,0.8,172,13,70.3
+APC-RLNC,99.32,0.6,145,11,82.1

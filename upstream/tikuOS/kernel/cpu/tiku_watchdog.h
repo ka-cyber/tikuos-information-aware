@@ -1,0 +1,108 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_watchdog.h - Watchdog timer interface
+ *
+ * Platform-independent watchdog timer API. All hardware access is
+ * delegated to the HAL (tiku_watchdog_hal.h).
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_WATCHDOG_H_
+#define TIKU_WATCHDOG_H_
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include <hal/tiku_watchdog_hal.h>
+#include <stdint.h>
+
+/*---------------------------------------------------------------------------*/
+/* FUNCTION PROTOTYPES                                                       */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Configure the watchdog timer with custom parameters
+ *
+ * Sets mode, clock source, interval, and startup behaviour. Only
+ * available on platforms whose HAL exposes these parameters.
+ *
+ * @param mode          Watchdog or interval timer mode
+ * @param clk           Clock source selection
+ * @param interval      Timeout interval
+ * @param start_held    If non-zero, start in held (paused) state
+ * @param kick_on_start If non-zero, kick the timer on start
+ */
+void tiku_watchdog_config(tiku_wdt_mode_t mode, tiku_wdt_clk_t clk,
+                         tiku_wdt_interval_t interval, int start_held,
+                         int kick_on_start);
+
+/** @brief Initialize the watchdog timer with default settings */
+void tiku_watchdog_init(void);
+
+/** @brief Kick (reset) the watchdog timer to prevent timeout */
+void tiku_watchdog_kick(void);
+
+/** @brief Pause the watchdog timer */
+void tiku_watchdog_pause(void);
+
+/** @brief Resume the watchdog timer */
+void tiku_watchdog_resume(void);
+
+/** @brief Resume the watchdog timer with an immediate kick */
+void tiku_watchdog_resume_with_kick(void);
+
+/** @brief Return "watchdog" or "interval" for the current WDT mode */
+const char *tiku_watchdog_mode_str(void);
+
+/** @brief Return the current watchdog mode */
+tiku_wdt_mode_t tiku_watchdog_get_mode(void);
+
+/** @brief Return the current clock source */
+tiku_wdt_clk_t tiku_watchdog_get_clk(void);
+
+/** @brief Return the current interval divider */
+tiku_wdt_interval_t tiku_watchdog_get_interval(void);
+
+/** @brief Return whether the stored configuration starts held. */
+int tiku_watchdog_get_start_held(void);
+
+/** @brief Return whether the stored configuration kicks when initialized. */
+int tiku_watchdog_get_kick_on_start(void);
+
+/** @brief Return non-zero when @p mode has a real backend on this build. */
+int tiku_watchdog_mode_supported(tiku_wdt_mode_t mode);
+
+/** @brief Disable the watchdog timer entirely */
+void tiku_watchdog_off(void);
+
+/**
+ * @brief Re-enable the watchdog after tiku_watchdog_off().
+ *
+ * Reapplies the most recent configuration (mode, clock, interval).
+ * No-op if the watchdog is already on.
+ */
+void tiku_watchdog_on(void);
+
+/**
+ * @brief Return non-zero if the watchdog is currently armed.
+ *
+ * "Armed" means tiku_watchdog_off() has not been called since the
+ * last init/config/on. Pause/resume do not affect this flag.
+ */
+int tiku_watchdog_is_on(void);
+
+/**
+ * @brief Return the number of successful kicks since boot.
+ *
+ * Incremented inside tiku_watchdog_kick(). Wraps at 2^32.
+ */
+uint32_t tiku_watchdog_kicks(void);
+
+#endif /* TIKU_WATCHDOG_H_ */

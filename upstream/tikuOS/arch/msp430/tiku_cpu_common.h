@@ -1,0 +1,100 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_cpu_common.h - MSP430 CPU common functions
+ *
+ * This file provides MSP430FR5969-specific hardware definitions and
+ * function prototypes for common CPU operations.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_CPU_COMMON_H_
+#define TIKU_CPU_COMMON_H_
+
+/*---------------------------------------------------------------------------*/
+/* INCLUDES                                                                  */
+/*---------------------------------------------------------------------------*/
+
+#include "tiku.h"
+
+#ifdef PLATFORM_MSP430
+
+/*---------------------------------------------------------------------------*/
+/* CONSTANTS AND MACROS                                                     */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @defgroup TIKU_BOARD_GPIO Board GPIO Definitions
+ * @brief Generic GPIO macros that delegate to the active board header
+ *
+ * The actual pin assignments are defined in the board header selected
+ * via tiku_device_select.h (e.g. tiku_board_fr5969_launchpad.h).
+ * Old MSP430_FR5969_* names are kept as backward-compatible aliases.
+ * @{
+ */
+
+/* Backward-compatible aliases -- map old names to new board macros */
+#define MSP430_FR5969_LED1_INIT()       TIKU_BOARD_LED1_INIT()
+#define MSP430_FR5969_LED1_ON()         TIKU_BOARD_LED1_ON()
+#define MSP430_FR5969_LED1_OFF()        TIKU_BOARD_LED1_OFF()
+#define MSP430_FR5969_LED1_TOGGLE()     TIKU_BOARD_LED1_TOGGLE()
+
+#define MSP430_FR5969_LED2_INIT()       TIKU_BOARD_LED2_INIT()
+#define MSP430_FR5969_LED2_ON()         TIKU_BOARD_LED2_ON()
+#define MSP430_FR5969_LED2_OFF()        TIKU_BOARD_LED2_OFF()
+#define MSP430_FR5969_LED2_TOGGLE()     TIKU_BOARD_LED2_TOGGLE()
+
+#define MSP430_FR5969_BTN1_INIT()       TIKU_BOARD_BTN1_INIT()
+#define MSP430_FR5969_BTN1_PRESSED()    TIKU_BOARD_BTN1_PRESSED()
+
+#define MSP430_FR5969_BTN2_INIT()       TIKU_BOARD_BTN2_INIT()
+#define MSP430_FR5969_BTN2_PRESSED()    TIKU_BOARD_BTN2_PRESSED()
+
+/** @} */ /* End of TIKU_BOARD_GPIO group */
+
+#endif /* PLATFORM_MSP430 */
+
+/*---------------------------------------------------------------------------*/
+/* TYPE DEFINITIONS                                                         */
+/*---------------------------------------------------------------------------*/
+
+/* None */
+
+/*---------------------------------------------------------------------------*/
+/* FUNCTION PROTOTYPES                                                      */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief MSP430-specific delay function
+ * @param ms Number of milliseconds to delay
+ */
+void tiku_cpu_msp430_delay_ms(unsigned int ms);
+
+/**
+ * @brief MSP430-specific microsecond delay
+ * @param us Number of microseconds to delay (max ~65535)
+ */
+void tiku_cpu_msp430_delay_us(unsigned int us);
+
+/**
+ * @brief Read the MSP430 die-record unique ID into a buffer.
+ * @param buf   Destination buffer
+ * @param len   Buffer size (up to 8 bytes returned)
+ * @return Number of bytes written
+ */
+uint8_t tiku_cpu_msp430_unique_id(uint8_t *buf, uint8_t len);
+
+/**
+ * @brief Return the reset-cause register value captured at boot.
+ *
+ * The VFS tree captures SYSRSTIV at init time; this function
+ * returns the same raw value for programmatic use.
+ */
+uint16_t tiku_cpu_msp430_reset_reason(void);
+
+#endif /* TIKU_CPU_COMMON_H_ */

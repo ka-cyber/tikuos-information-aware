@@ -1,0 +1,1610 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_ra8p1_regs.h - RA8P1 register bases and the few bits the port needs.
+ *
+ * Every address here is from the RA8P1 Group User's Manual: Hardware
+ * (R01UH1064EJ0130) or the Group Datasheet (R01DS0439EJ0110), with the
+ * section cited on each block; the Cortex-M85 blocks cite the Arm ARM.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_RA8P1_REGS_H_
+#define TIKU_RA8P1_REGS_H_
+
+#include <stdint.h>
+
+/** @brief 32-bit MMIO accessor; volatile so the compiler keeps every access. */
+#define TIKU_REG32(a)   (*(volatile uint32_t *)(uintptr_t)(a))
+/** @brief 8-bit MMIO accessor, for the byte-wide protect registers. */
+#define TIKU_REG8(a)    (*(volatile uint8_t *)(uintptr_t)(a))
+/** @brief 16-bit MMIO accessor; the watchdogs insist on halfword access. */
+#define TIKU_REG16(a)   (*(volatile uint16_t *)(uintptr_t)(a))
+
+/*---------------------------------------------------------------------------*/
+/* System control (UM 9, "Clock Generation Circuit")                         */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_SYSC_BASE         0x4001E000UL
+#define RA8P1_SCKDIVCR          (RA8P1_SYSC_BASE + 0x020UL)  /* UM 9.2.2  */
+#define RA8P1_SCKSCR            (RA8P1_SYSC_BASE + 0x026UL)  /* UM 9.2.5  */
+
+/*
+ * Clock registers are write-protected: PRCR_S.PRC0 must be 1, and every write
+ * to PRCR_S itself must carry the key in the top byte or it is ignored.  A
+ * missing unlock does not fault -- the write is simply dropped, and the
+ * symptom is an oscillator that never starts.
+ */
+#define RA8P1_PRCR_S            (RA8P1_SYSC_BASE + 0x3FAUL)  /* 16-bit    */
+#define RA8P1_PRCR_KEY          0xA500U
+#define RA8P1_PRCR_PRC0         (1U << 0)   /* clock generation circuit    */
+#define RA8P1_PRCR_PRC1         (1U << 1)   /* low-power modes, incl. VSCR */
+
+/*
+ * Voltage scaling (UM 11.7).  VSCR_1 is 0.95 V and permits the full 1 GHz;
+ * VSCR_2, the reset default at 0.925 V, carries up to the 600 MHz class per
+ * the ch.70 current tables.  The transition is asynchronous: write VSCM,
+ * then wait for VSCMTSF to clear -- and the CM85 caches must be OFF while it
+ * is in flight (UM 11.7, stated for TCM and cache both).  PRC1 gates writes.
+ */
+#define RA8P1_VSCR              (RA8P1_SYSC_BASE + 0x014UL)  /* 8-bit */
+#define RA8P1_VSCR_VSCM_MASK    0x07U
+#define RA8P1_VSCR_VSCM_1       0x01U        /* 0.95 V: 800 MHz and 1 GHz  */
+#define RA8P1_VSCR_VSCM_2       0x02U        /* 0.925 V: reset default     */
+#define RA8P1_VSCR_VSCMTSF      (1U << 4)
+
+/* Main clock oscillator: the board's 24 MHz crystal (UM 9). */
+#define RA8P1_MOSCCR            (RA8P1_SYSC_BASE + 0x032UL)  /* 8-bit     */
+#define RA8P1_MOSCCR_MOSTP      (1U << 0)   /* 1 = stopped                 */
+#define RA8P1_MOSCWTCR          (RA8P1_SYSC_BASE + 0x0A2UL)  /* 8-bit     */
+#define RA8P1_OSCSF             (RA8P1_SYSC_BASE + 0x03CUL)  /* 8-bit     */
+#define RA8P1_OSCSF_HOCOSF      (1U << 0)
+#define RA8P1_OSCSF_MOSCSF      (1U << 3)
+#define RA8P1_OSCSF_PLLSF       (1U << 5)
+#define RA8P1_MOMCR             (RA8P1_SYSC_BASE + 0xA50UL)  /* 8-bit     */
+#define RA8P1_MOMCR_DRV_24MHZ   (0x3U << 1)  /* MODRV0 = 011: 8-24 MHz     */
+#define RA8P1_MOMCR_MOSEL_EXT   (1U << 6)    /* 0 = resonator              */
+
+/*
+ * SCKDIVCR packs one 4-bit divider code per clock domain.  Codes 0..6 are
+ * 2^code and codes 8..11 are 3, 6, 12, 24 -- the odd divisors are NOT a
+ * continuation of the power-of-two run, which is the trap in reading this
+ * register as a shift count.
+ */
+#define RA8P1_SCKDIVCR_PCKD_SHIFT   0U
+#define RA8P1_SCKDIVCR_PCKC_SHIFT   4U
+#define RA8P1_SCKDIVCR_PCKB_SHIFT   8U
+#define RA8P1_SCKDIVCR_PCKA_SHIFT   12U
+#define RA8P1_SCKDIVCR_BCK_SHIFT    16U
+#define RA8P1_SCKDIVCR_PCKE_SHIFT   20U
+#define RA8P1_SCKDIVCR_ICK_SHIFT    24U
+#define RA8P1_SCKDIVCR_MRPCK_SHIFT  28U
+#define RA8P1_SCKSCR_CKSEL_MASK     0x07U
+
+/*
+ * SCKDIVCR2 carries the clocks SCKDIVCR does not: the two CPU clocks, the NPU
+ * and the MRAM instruction bus.  CPUCLK0 is NOT the ICK field -- the core can
+ * run at 1 GHz while ICLK is capped at 250 MHz, so they are separate knobs and
+ * treating ICK as the core clock would cap the part at a quarter of its rate.
+ */
+#define RA8P1_SCKDIVCR2             (RA8P1_SYSC_BASE + 0x024UL)
+#define RA8P1_SCKDIVCR2_CPUCK0_SHIFT  0U
+#define RA8P1_SCKDIVCR2_CPUCK1_SHIFT  4U
+#define RA8P1_SCKDIVCR2_NPUCK_SHIFT   8U
+#define RA8P1_SCKDIVCR2_MRICK_SHIFT   12U
+
+/*
+ * PLL1 (UM 9.2.6-9.2.8, Table 9.1).  PLLMUL is the multiplier minus one:
+ * 0x27 is x40.
+ *
+ * The windows are what bound every operating point, so they are here rather
+ * than in whichever driver last needed them:
+ *
+ *   PLL input, after PLIDIV   8 to 24 MHz
+ *   multiplier                40 to 300, plus a fraction of 0/0.33/0.5/0.66
+ *   VCO                       960 to 2400 MHz
+ *   PLL1P out                 60 to 1200 MHz, BUT Table 9.2's note caps any
+ *                             PLL used as a clock source at 1 GHz
+ *
+ * x40 being the multiplier FLOOR is why the VCO cannot idle low: a 24 MHz
+ * reference at PLIDIV /1 pins it to 960 MHz minimum.  With PLODIVP bottoming
+ * out at /2, that makes 480 MHz the fastest PLL1P reachable without changing
+ * the multiplier -- and 1 GHz needs a 2000 MHz VCO, i.e. 8 MHz in (PLIDIV /3)
+ * times 250, out through /2.
+ */
+#define RA8P1_PLLCCR                (RA8P1_SYSC_BASE + 0x0ACUL)  /* 32-bit */
+#define RA8P1_PLLCCR2               (RA8P1_SYSC_BASE + 0x04CUL)  /* 16-bit */
+#define RA8P1_PLLCR                 (RA8P1_SYSC_BASE + 0x02AUL)  /* 8-bit  */
+#define RA8P1_PLLCR_PLLSTP          (1U << 0)   /* 1 = stopped             */
+#define RA8P1_PLLCCR_PLIDIV(n)      (((uint32_t)(n) & 0x3UL) << 0)
+#define RA8P1_PLLCCR_SRC_HOCO       (1UL << 4)  /* 0 = main oscillator     */
+#define RA8P1_PLLCCR_PLLMULNF(c)    (((uint32_t)(c) & 0x3UL) << 6)
+#define RA8P1_PLLCCR_PLLMUL(m)      ((((uint32_t)(m) - 1UL) & 0x1FFUL) << 8)
+#define RA8P1_PLLCCR2_PLODIVP(c)    (((uint16_t)(c) & 0xFU) << 0)
+#define RA8P1_PLLCCR2_PLODIVQ(c)    (((uint16_t)(c) & 0xFU) << 4)
+#define RA8P1_PLLCCR2_PLODIVR(c)    (((uint16_t)(c) & 0xFU) << 8)
+
+/** @brief PLIDIV codes; /4 does NOT exist, unlike most dividers on this part. */
+#define RA8P1_PLIDIV_1              0x0U
+#define RA8P1_PLIDIV_2              0x1U
+#define RA8P1_PLIDIV_3              0x2U
+
+/** @brief PLLMULNF fraction codes, added to PLLMUL. */
+#define RA8P1_PLLMULNF_0            0x0U
+#define RA8P1_PLLMULNF_033          0x1U
+#define RA8P1_PLLMULNF_066          0x2U
+#define RA8P1_PLLMULNF_050          0x3U
+
+/*
+ * PLL output-divider codes; NOT the SCKDIVCR set, and NOT contiguous.
+ * There is no /1: P bottoms out at /2, which is the single fact that decides
+ * how fast this part can be clocked from a given VCO.  Q and R additionally
+ * offer /5 and /1.5, which P does not.
+ */
+#define RA8P1_PLODIV_2              0x1U
+#define RA8P1_PLODIV_3              0x2U
+#define RA8P1_PLODIV_4              0x3U
+#define RA8P1_PLODIV_6              0x5U
+#define RA8P1_PLODIV_8              0x7U
+#define RA8P1_PLODIV_16             0xFU
+
+/*
+ * Clock-tree restrictions (UM Table 9.2 notes).  Every one of these is a
+ * "the part works but is out of spec" rule rather than something a register
+ * refuses, so nothing reports a violation -- they are checked when a tree is
+ * built, or not at all:
+ *
+ *   ordering   CPUCLK0/CPUCLK1/NPUCLK/MRICLK all >= ICLK
+ *              CPUCLK0/CPUCLK1/NPUCLK        all >= MRICLK
+ *              ICLK >= MRPCLK, ICLK >= BCLK, ICLK >= PCLKA >= PCLKB
+ *              PCLKD >= PCLKA >= PCLKB
+ *   ratios     integer N:1 against ICLK (N <= 64); PCLKC/D/E may also be 1:N
+ *   mixing     if ANY SCKDIVCR/SCKDIVCR2 field selects /3 /6 /12 /24, no
+ *              other field may select /2 /4 /8 /16 /32 /64
+ *   source     PLSRCSEL must be 0 (main oscillator) when CPUCLK0 > 960 MHz
+ */
+
+/*
+ * MRAM must be TOLD the frequency it is about to run at, before the clock
+ * rises: MRCMHZ picks the read wait states (<=100 MHz none, <=200 one,
+ * <=250 two, and 250 is the ceiling -- above it the encoding is reserved,
+ * which is why MRICLK can never follow the core past 250).  Writes need the
+ * key in the top byte and must be 32-bit.  The value is the frequency in
+ * whole MHz, rounded UP.
+ *
+ * Ordering is directional and the two directions differ (UM 60.4.3): going
+ * FASTER, tell MRAM before the clock rises; going SLOWER, tell it after.
+ * The full procedure also disables the prefetch buffer across the change and
+ * reads MRCFREQ back to confirm it took -- a notification register that
+ * silently did not land would mean running at too few wait states.
+ */
+#define RA8P1_MRCPFB                0x4013C000UL /* 8-bit, resets DISABLED */
+#define RA8P1_MRCPFB_MPFBEN         (1U << 0)
+#define RA8P1_MRCFREQ               0x4013C004UL
+#define RA8P1_MRCFREQ_KEY           (0x1EUL << 24)
+#define RA8P1_MREFREQ               0x4013C008UL /* extra MRAM, same idea */
+#define RA8P1_MREFREQ_KEY           (0xE1UL << 24)
+#define RA8P1_MRCFREQ_MHZ_MASK      0x3FFUL
+#define RA8P1_MRCFREQ_MHZ_MAX       250UL
+
+/*
+ * The SCI has its OWN clock, SCICLK -- it is NOT PCLKA.  Both are MOCO at /1
+ * out of reset, which is why a PCLKA-derived baud divisor works at boot and
+ * then silently does not once the tree moves: SCICKCR keeps the console on
+ * MOCO until it is told otherwise.  Switching needs the request/ready
+ * handshake (UM 9.2.54), and the clock is OFF while the request is asserted.
+ */
+#define RA8P1_SCICKDIVCR        (RA8P1_SYSC_BASE + 0x054UL)  /* 8-bit */
+#define RA8P1_SCICKCR           (RA8P1_SYSC_BASE + 0x055UL)  /* 8-bit */
+
+/*
+ * Octal-SPI clock.  Another private clock register in the SCICKCR/GTCLKCR
+ * family: the OSPI module has no divider of its own, so OCTACLK is the only
+ * thing that sets the flash bus speed, and it comes out of reset on MOCO.
+ * OM_SCLK is OCTACLK divided by two (UM Table 4.4), which is the whole
+ * reason a 240 MHz source is the right one rather than an overclock.
+ * PRCR.PRC0 gates writes here, as with every clock register.
+ */
+#define RA8P1_OCTACKDIVCR       (RA8P1_SYSC_BASE + 0x06DUL)  /* 8-bit */
+#define RA8P1_OCTACKCR          (RA8P1_SYSC_BASE + 0x075UL)  /* 8-bit */
+#define RA8P1_OCTACKCR_SEL_MASK 0x0FU
+#define RA8P1_OCTACKCR_SEL_MOCO 0x01U
+#define RA8P1_OCTACKCR_SEL_PLL1P 0x05U
+#define RA8P1_OCTACKCR_SREQ     (1U << 6)
+#define RA8P1_OCTACKCR_SRDY     (1U << 7)
+/*
+ * SCICKDIVCR and OCTACKDIVCR share one encoding, and it is NOT monotonic:
+ * /4 is 0x2 while /3 is 0x5.  Deriving a code by arithmetic on the divisor
+ * therefore produces a plausible wrong answer rather than a compile error,
+ * which is why every value in the set is spelled out here.
+ *
+ * Ceilings differ though (UM Table 9.2): SCICLK tops out at 120 MHz, OCTACLK
+ * at 333.33 -- and OM_SCLK is OCTACLK/2, itself capped at 166.67 and further
+ * bounded by whatever the fitted flash part allows (133 for the MX25LW).
+ */
+#define RA8P1_CKDIV_1           0x0U
+#define RA8P1_CKDIV_2           0x1U
+#define RA8P1_CKDIV_4           0x2U
+#define RA8P1_CKDIV_6           0x3U
+#define RA8P1_CKDIV_8           0x4U
+#define RA8P1_CKDIV_3           0x5U
+#define RA8P1_CKDIV_5           0x6U
+#define RA8P1_CKDIV_10          0x7U
+#define RA8P1_CKDIV_16          0x8U
+#define RA8P1_CKDIV_32          0x9U
+
+#define RA8P1_OCTACKDIV_1       0x0U
+#define RA8P1_SCICKCR_SREQ      (1U << 6)
+#define RA8P1_SCICKCR_SRDY      (1U << 7)
+#define RA8P1_SCICKSEL_MOCO     0x1U
+#define RA8P1_SCICKSEL_PLL1P    0x5U
+#define RA8P1_SCICKDIV_1        0x0U
+#define RA8P1_SCICKDIV_2        0x1U
+
+/* SRAM needs a wait state once ICLK passes half its 250 MHz maximum. */
+#define RA8P1_SRAMWTSC              0x40002008UL
+#define RA8P1_SRAMWTSC_WTEN         (1U << 0)
+
+/*
+ * Dual-core control (UM 2.9.1).  CPU1 is the Cortex-M33, present only on the
+ * K variant of this part (Table 1.15).
+ *
+ * ACTCSR and CRPT take a 0xA5 key in the upper byte of a 16-bit write, or the
+ * write is discarded silently.  CPUWAIT resets to 0, so an activated core
+ * begins executing at once, and the bit is sampled only as the core leaves
+ * reset -- raising it later cannot stall a core already running.  INITVTOR
+ * resets to 0x0200_0000, the M85's own vector table, so a CPU1 released
+ * without setting it runs the M85's image on an M33.
+ */
+#define RA8P1_CPU_CTRL_BASE     0x4000F000UL
+#define RA8P1_CPU1INITVTOR      (RA8P1_CPU_CTRL_BASE + 0x044UL) /* 32-bit */
+#define RA8P1_CPU1WAITCR        (RA8P1_CPU_CTRL_BASE + 0x054UL) /*  8-bit */
+#define RA8P1_CPU1ACTCSR        (RA8P1_CPU_CTRL_BASE + 0x064UL) /* 16-bit */
+#define RA8P1_CPU1CRPT          (RA8P1_CPU_CTRL_BASE + 0x844UL) /* 16-bit */
+#define RA8P1_CPUCTRL_KEY       (0xA5U << 8)
+#define RA8P1_CPUWAIT           (1U << 0)
+#define RA8P1_ACTCSR_ACTREQ     (1U << 0)
+#define RA8P1_ACTCSR_ACT        (1U << 7)
+#define RA8P1_CRPT_PROTECT      (1U << 0)
+
+/*
+ * Inter-processor communication (UM 3).  IPC0* carries CPU1 -> CPU0 and
+ * IPC1* the other way; each direction has two four-deep 32-bit FIFOs plus
+ * eight software interrupt bits, and IPC_IRQ0 (event 0x05B) is the line the
+ * ICU can route to this core's NVIC.
+ *
+ * STA is READ-ONLY: the bits are set through ISET and cleared through CLR,
+ * so an ISR that tries to write STA clears nothing and the interrupt
+ * re-enters forever.
+ */
+#define RA8P1_IPC_BASE          0x40020000UL      /* secure view          */
+#define RA8P1_IPC0STA0          (RA8P1_IPC_BASE + 0x0C0UL)  /* CPU1->CPU0 */
+#define RA8P1_IPC0ISET0         (RA8P1_IPC_BASE + 0x0C4UL)
+#define RA8P1_IPC0TXD0          (RA8P1_IPC_BASE + 0x0C8UL)
+#define RA8P1_IPC0RXD0          (RA8P1_IPC_BASE + 0x0CCUL)
+#define RA8P1_IPC0CLR0          (RA8P1_IPC_BASE + 0x0D0UL)
+#define RA8P1_IPC1STA0          (RA8P1_IPC_BASE + 0x100UL)  /* CPU0->CPU1 */
+#define RA8P1_IPC1ISET0         (RA8P1_IPC_BASE + 0x104UL)
+#define RA8P1_IPC1TXD0          (RA8P1_IPC_BASE + 0x108UL)
+#define RA8P1_IPC1RXD0          (RA8P1_IPC_BASE + 0x10CUL)
+#define RA8P1_IPC1CLR0          (RA8P1_IPC_BASE + 0x110UL)
+#define RA8P1_IPC_IRQ(n)        (1UL << (n))      /* IRQ7..0, STA/ISET/CLR */
+#define RA8P1_IPC_STA_RDY       (1UL << 16)       /* FIFO not empty       */
+#define RA8P1_IPC_STA_FULL      (1UL << 17)
+#define RA8P1_IPC_STA_RERR      (1UL << 24)       /* read while empty     */
+#define RA8P1_IPC_STA_FERR      (1UL << 25)       /* write while full     */
+#define RA8P1_IPC_CLR_RCLR      (1UL << 24)
+#define RA8P1_IPC_CLR_FCLR      (1UL << 25)
+
+/*
+ * Reset status (UM 6.2).  Note the offsets are NOT adjacent: RSTSR1 sits at
+ * 0x0C0 while RSTSR0 and RSTSR2 are up at 0xA40/0xA44.
+ */
+#define RA8P1_RSTSR0            (RA8P1_SYSC_BASE + 0xA40UL)  /* 8-bit  */
+#define RA8P1_RSTSR1            (RA8P1_SYSC_BASE + 0x0C0UL)  /* 16-bit */
+#define RA8P1_RSTSR2            (RA8P1_SYSC_BASE + 0xA44UL)  /* 8-bit  */
+#define RA8P1_RSTSR0_PORF       (1U << 0)
+#define RA8P1_RSTSR0_DPSRSTF    (1U << 7)
+#define RA8P1_RSTSR1_IWDTRF     (1U << 0)
+#define RA8P1_RSTSR1_WDT0RF     (1U << 1)
+#define RA8P1_RSTSR1_SWRF       (1U << 2)
+
+/** @brief Unique ID words (UM 60.5.41), four of them, read-only. */
+#define RA8P1_UIDR(n)           (0x02F07B00UL + (4UL * (n)))
+
+/*---------------------------------------------------------------------------*/
+/* Module stop (UM 11.2, "Module Stop Control Registers")                    */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_MSTP_BASE         0x40203000UL
+#define RA8P1_MSTPCRB           (RA8P1_MSTP_BASE + 0x04UL)   /* UM 11.2.7 */
+#define RA8P1_MSTPB_SCI8        (1UL << 23)                  /* SCI8       */
+
+/*---------------------------------------------------------------------------*/
+/* Octal SPI controller (UM 45) -- EK-RA8P1 U3, MX25LW51245G, 64 MB          */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_OSPI_BASE(n)      (0x40268000UL + (0x400UL * (n)))
+#define RA8P1_OSPI_WRAPCFG(n)   (RA8P1_OSPI_BASE(n) + 0x000UL)
+#define RA8P1_OSPI_COMCFG(n)    (RA8P1_OSPI_BASE(n) + 0x004UL)
+#define RA8P1_OSPI_BMCFG(n, c)  (RA8P1_OSPI_BASE(n) + 0x008UL + (0x4UL * (c)))
+#define RA8P1_OSPI_CMCFG0(n, c) (RA8P1_OSPI_BASE(n) + 0x010UL + (0x10UL * (c)))
+#define RA8P1_OSPI_CMCFG1(n, c) (RA8P1_OSPI_BASE(n) + 0x014UL + (0x10UL * (c)))
+#define RA8P1_OSPI_CMCFG2(n, c) (RA8P1_OSPI_BASE(n) + 0x018UL + (0x10UL * (c)))
+#define RA8P1_OSPI_LIOCFG(n, c) (RA8P1_OSPI_BASE(n) + 0x050UL + (0x04UL * (c)))
+#define RA8P1_OSPI_CMCTL(n, c)  (RA8P1_OSPI_BASE(n) + 0x068UL + (0x04UL * (c)))
+
+/* Manual command: the path that issues one transaction and reads its reply,
+ * which is how a device is identified before any memory-map mode is set up. */
+#define RA8P1_OSPI_CDCTL0(n)    (RA8P1_OSPI_BASE(n) + 0x070UL)
+#define RA8P1_OSPI_CDCTL1(n)    (RA8P1_OSPI_BASE(n) + 0x074UL)
+#define RA8P1_OSPI_CDCTL2(n)    (RA8P1_OSPI_BASE(n) + 0x078UL)
+#define RA8P1_OSPI_CDTBUF(n, b) (RA8P1_OSPI_BASE(n) + 0x080UL + (0x10UL * (b)))
+#define RA8P1_OSPI_CDABUF(n, b) (RA8P1_OSPI_BASE(n) + 0x084UL + (0x10UL * (b)))
+#define RA8P1_OSPI_CDD0BUF(n,b) (RA8P1_OSPI_BASE(n) + 0x088UL + (0x10UL * (b)))
+#define RA8P1_OSPI_CDD1BUF(n,b) (RA8P1_OSPI_BASE(n) + 0x08CUL + (0x10UL * (b)))
+#define RA8P1_OSPI_BMCTL0(n)    (RA8P1_OSPI_BASE(n) + 0x060UL)
+#define RA8P1_OSPI_LIOCTL(n)    (RA8P1_OSPI_BASE(n) + 0x108UL)
+
+/* Memory-map command config.  CMCFG1 holds the read opcode and its latency;
+ * FFMT picks the frame shape and ADDSIZE the address width. */
+#define RA8P1_CMCFG0_FFMT_NORMAL  (0UL << 0)
+#define RA8P1_CMCFG0_FFMT_8D      (1UL << 0)
+#define RA8P1_CMCFG0_ADDSIZE(n)   ((((uint32_t)(n) - 1UL) & 0x3UL) << 2)
+#define RA8P1_CMCFG1_RDCMD(c)     (((uint32_t)(c) & 0xFFFFUL) << 0)
+#define RA8P1_CMCFG1_RDLATE(n)    (((uint32_t)(n) & 0x1FUL) << 16)
+
+/*
+ * BMCFGCHn: bridge behaviour for one channel.  PREEN is the one that matters
+ * for bulk reads -- without prefetch every incremental read pays the full
+ * command + address + latency again, so the bus spends most of its cycles
+ * re-announcing where it already is.
+ */
+#define RA8P1_BMCFG_WRMD        (1UL << 0)
+#define RA8P1_BMCFG_MWRCOMB     (1UL << 7)
+#define RA8P1_BMCFG_MWRSIZE(n)  (((uint32_t)(n) & 0xFFUL) << 8)
+#define RA8P1_BMCFG_MWRSIZE_64  0x0FUL    /* max: 64 bytes per combined frame */
+#define RA8P1_BMCFG_PREEN       (1UL << 16)
+#define RA8P1_BMCFG_CMBTIM(n)   (((uint32_t)(n) & 0xFFUL) << 24)
+
+/* BMCTL0: two bits per (channel, chip select).  01 = read enable. */
+#define RA8P1_BMCTL0_CH0CS1_RD    (1UL << 2)
+#define RA8P1_BMCTL0_CH0CS1_WR    (1UL << 3)
+#define RA8P1_CMCFG2_WRCMD(c)     (((uint32_t)(c) & 0xFFFFUL) << 0)
+#define RA8P1_CMCFG2_WRLATE(n)    (((uint32_t)(n) & 0x1FUL) << 16)
+
+/*
+ * LIOCFGCSn protocol mode.  Only the listed encodings exist -- the manual
+ * marks every other value "setting prohibited" -- and the list is the reason
+ * this port runs the flash in DTR and not STR octal: there is a 8D-8D-8D
+ * encoding and NO 8S-8S-8S one, so the simpler-looking STR OPI mode has no
+ * way to be expressed on this controller at all.
+ */
+#define RA8P1_LIOCFG_PRTMD_MASK   0x3FFUL
+#define RA8P1_LIOCFG_PRTMD_1S1S1S 0x000UL
+#define RA8P1_LIOCFG_PRTMD_8D8D8D 0x3FFUL
+/* Extends the DDR sampling window; how far depends on the memory's output
+ * delay, so it is calibrated against real data rather than assumed. */
+#define RA8P1_LIOCFG_DDRSMPEX(n)  (((uint32_t)(n) & 0xFUL) << 28)
+#define RA8P1_LIOCFG_DDRSMPEX_MASK (0xFUL << 28)
+#define RA8P1_LIOCFG_CSMIN(n)     (((uint32_t)(n) & 0xFUL) << 16)
+#define RA8P1_LIOCFG_CSMIN_MASK   (0xFUL << 16)
+
+/*
+ * WRAPCFG.DSSFTCSn -- delay cells on the OM_DQS input, 0..31.  The
+ * configuration flow calls this "drive/sample timing"; leaving it at its
+ * reset 0 puts the strobe on the data transition, so one of the two DDR
+ * edges captures garbage and every other byte comes back wrong.
+ */
+#define RA8P1_WRAPCFG_DSSFTCS0(n)   (((uint32_t)(n) & 0x1FUL) << 8)
+#define RA8P1_WRAPCFG_DSSFTCS0_MASK (0x1FUL << 8)
+#define RA8P1_WRAPCFG_DSSFTCS1(n)   (((uint32_t)(n) & 0x1FUL) << 24)
+#define RA8P1_WRAPCFG_DSSFTCS1_MASK (0x1FUL << 24)
+#define RA8P1_OSPI_COMSTT(n)    (RA8P1_OSPI_BASE(n) + 0x184UL)
+
+/* LIOCTL.RSTCS0 drives the OM_RESET pin: 0 = LOW.  It RESETS TO 0, so the
+ * instant the reset pin is muxed to the OSPI function the controller holds
+ * the flash in hardware reset until software says otherwise. */
+#define RA8P1_OSPI_LIOCTL_RSTCS0 (1UL << 16)
+
+/* Mapped windows, from the address map: OSPI0 gets 256 MB per chip select,
+ * OSPI1 gets 128 MB. */
+#define RA8P1_OSPI0_CS0_ADDR    0x80000000UL
+#define RA8P1_OSPI1_CS0_ADDR    0x70000000UL
+
+/* Manual-command transaction descriptor (CDTBUFn).  Sizes are byte COUNTS,
+ * not encodings, except that command size 10b means 2 bytes -- which is what
+ * 8D-8D-8D octal needs, where opcodes are sent as a value and its complement. */
+#define RA8P1_CDTBUF_CMDSIZE(n) (((uint32_t)(n) & 0x3UL) << 0)    /*  1:0 */
+#define RA8P1_CDTBUF_ADDSIZE(n) (((uint32_t)(n) & 0x7UL) << 2)    /*  4:2 */
+#define RA8P1_CDTBUF_DATASIZE(n) (((uint32_t)(n) & 0xFUL) << 5)   /*  8:5 */
+#define RA8P1_CDTBUF_LATE(n)    (((uint32_t)(n) & 0x1FUL) << 9)   /* 13:9 */
+#define RA8P1_CDTBUF_CMD(c)     (((uint32_t)(c) & 0xFFFFUL) << 16)
+#define RA8P1_CDTBUF_TRTYPE_WRITE (1UL << 15)   /* 0 = read from the slave */
+
+#define RA8P1_CDCTL0_TRREQ      (1UL << 0)   /* self-clears on completion */
+#define RA8P1_CDCTL0_PERMD      (1UL << 1)
+#define RA8P1_CDCTL0_CSSEL      (1UL << 3)   /* 0 = CS0, 1 = CS1 */
+
+/** @brief Module stop: OSPI0 (the board's flash) is MSTPB16, OSPI1 MSTPB17. */
+#define RA8P1_MSTPB_OSPI0       (1UL << 16)
+#define RA8P1_MSTPB_OSPI1       (1UL << 17)
+/** @brief Module stop for the USB 2.0 high-speed controller (UM 11.2.7). */
+#define RA8P1_MSTPB_USBHS       (1UL << 12)
+
+/*---------------------------------------------------------------------------*/
+/* USB 2.0 High-Speed Module (UM 38)                                         */
+/*---------------------------------------------------------------------------*/
+/*
+ * The classic Renesas pipe controller: 16-bit registers throughout, a
+ * default control pipe plus nine programmable ones, and an on-chip UTMI
+ * transceiver on dedicated DP/DM pins -- so unlike every other bus on this
+ * board there is no pin muxing to get wrong for the data lines.
+ *
+ * The clock is the part worth writing down.  High speed requires the PHY's
+ * own PLL running from a 12/20/24/48 MHz reference on the EXTAL pin, which
+ * on this board is the 24 MHz crystal that is already running.  It does NOT
+ * use USBCLK: that feeds USBFS, and USBHS only in CL-only mode -- a mode the
+ * manual states plainly does not support high speed.  So there is no
+ * USBCKCR request/ready dance here, despite USBCKCR being a member of this
+ * part's private-clock-register family.
+ */
+#define RA8P1_USBHS_BASE        0x40351000UL
+#define RA8P1_USBHS_SYSCFG      (RA8P1_USBHS_BASE + 0x000UL)  /* 16-bit */
+#define RA8P1_USBHS_SYSSTS0     (RA8P1_USBHS_BASE + 0x004UL)
+#define RA8P1_USBHS_PLLSTA      (RA8P1_USBHS_BASE + 0x006UL)
+#define RA8P1_USBHS_DVSTCTR0    (RA8P1_USBHS_BASE + 0x008UL)
+#define RA8P1_USBHS_TESTMODE    (RA8P1_USBHS_BASE + 0x00CUL)
+#define RA8P1_USBHS_INTENB0     (RA8P1_USBHS_BASE + 0x030UL)
+#define RA8P1_USBHS_INTENB1     (RA8P1_USBHS_BASE + 0x032UL)
+#define RA8P1_USBHS_SOFCFG      (RA8P1_USBHS_BASE + 0x03CUL)
+#define RA8P1_USBHS_PHYSET      (RA8P1_USBHS_BASE + 0x03EUL)
+#define RA8P1_USBHS_INTSTS0     (RA8P1_USBHS_BASE + 0x040UL)
+#define RA8P1_USBHS_INTSTS1     (RA8P1_USBHS_BASE + 0x042UL)
+#define RA8P1_USBHS_FRMNUM      (RA8P1_USBHS_BASE + 0x04CUL)
+#define RA8P1_USBHS_USBADDR     (RA8P1_USBHS_BASE + 0x050UL)
+#define RA8P1_USBHS_DCPCTR      (RA8P1_USBHS_BASE + 0x060UL)
+#define RA8P1_USBHS_LPCTRL      (RA8P1_USBHS_BASE + 0x100UL)
+#define RA8P1_USBHS_LPSTS       (RA8P1_USBHS_BASE + 0x102UL)
+
+/* Control transfers.  The hardware DECODES the setup packet into these four
+ * registers, so there is no eight-byte FIFO read and no chance of losing a
+ * SETUP to a mistimed one. */
+#define RA8P1_USBHS_USBREQ      (RA8P1_USBHS_BASE + 0x054UL)  /* type|request */
+#define RA8P1_USBHS_USBVAL      (RA8P1_USBHS_BASE + 0x056UL)  /* wValue       */
+#define RA8P1_USBHS_USBINDX     (RA8P1_USBHS_BASE + 0x058UL)  /* wIndex       */
+#define RA8P1_USBHS_USBLENG     (RA8P1_USBHS_BASE + 0x05AUL)  /* wLength      */
+#define RA8P1_USBHS_DCPCFG      (RA8P1_USBHS_BASE + 0x05CUL)
+#define RA8P1_USBHS_DCPMAXP     (RA8P1_USBHS_BASE + 0x05EUL)
+
+/*
+ * The CFIFO port is the only way to reach the DCP's 64-byte buffer -- and the
+ * address to use depends on the access width, in the opposite direction to
+ * what the names suggest.  With BIGEND=0 (little endian), UM Table 38.8 says
+ * 8-bit access must go to CFIFO*HH* at 0x017 and calls CFIFOLL at 0x014
+ * "access prohibited" -- 0x014 being exactly the offset the register is
+ * listed under.  16-bit access likewise uses CFIFOH at 0x016.
+ *
+ * Writing bytes to 0x014 is therefore silently discarded: FRDY still reads
+ * ready, BVAL still commits, and BEMP still fires -- because the buffer was
+ * empty and stayed empty.  The host sees a device that never answers an IN
+ * token and reports a timeout, with nothing on the device side reporting
+ * anything at all.
+ */
+#define RA8P1_USBHS_CFIFO       (RA8P1_USBHS_BASE + 0x014UL)  /* 32-bit     */
+#define RA8P1_USBHS_CFIFOH      (RA8P1_USBHS_BASE + 0x016UL)  /* 16-bit, LE */
+#define RA8P1_USBHS_CFIFOHH     (RA8P1_USBHS_BASE + 0x017UL)  /* 8-bit,  LE */
+#define RA8P1_USBHS_CFIFOSEL    (RA8P1_USBHS_BASE + 0x020UL)
+#define RA8P1_USBHS_CFIFOCTR    (RA8P1_USBHS_BASE + 0x022UL)
+#define RA8P1_USBHS_BRDYENB     (RA8P1_USBHS_BASE + 0x036UL)
+#define RA8P1_USBHS_BEMPENB     (RA8P1_USBHS_BASE + 0x03AUL)
+#define RA8P1_USBHS_BRDYSTS     (RA8P1_USBHS_BASE + 0x046UL)
+#define RA8P1_USBHS_BEMPSTS     (RA8P1_USBHS_BASE + 0x04AUL)
+#define RA8P1_USBHS_PIPESEL     (RA8P1_USBHS_BASE + 0x064UL)
+#define RA8P1_USBHS_PIPECFG     (RA8P1_USBHS_BASE + 0x068UL)
+#define RA8P1_USBHS_PIPEBUF     (RA8P1_USBHS_BASE + 0x06AUL)
+#define RA8P1_USBHS_PIPEMAXP    (RA8P1_USBHS_BASE + 0x06CUL)
+#define RA8P1_USBHS_PIPECTR(n)  (RA8P1_USBHS_BASE + 0x070UL + (2UL * ((n) - 1U)))
+
+/* D0FIFO: a second port so bulk pipes need not fight the DCP for CFIFO.
+ * 32-bit access is valid at N+0 with BIGEND=0 (UM Table 38.6), unlike the
+ * 8-bit case -- so bulk data moves a word at a time from 0x018. */
+#define RA8P1_USBHS_D0FIFO      (RA8P1_USBHS_BASE + 0x018UL)  /* 32-bit, LE */
+#define RA8P1_USBHS_D0FIFOSEL   (RA8P1_USBHS_BASE + 0x028UL)
+#define RA8P1_USBHS_D0FIFOCTR   (RA8P1_USBHS_BASE + 0x02AUL)
+
+/* PIPECFG / PIPEBUF / PIPEMAXP / PIPEnCTR */
+#define RA8P1_PIPECFG_EPNUM(n)  ((uint16_t)((n) & 0xFU))
+#define RA8P1_PIPECFG_DIR_IN    (1U << 4)    /* 1 = transmitting to host   */
+#define RA8P1_PIPECFG_SHTNAK    (1U << 7)
+#define RA8P1_PIPECFG_CNTMD     (1U << 8)
+#define RA8P1_PIPECFG_DBLB      (1U << 9)
+#define RA8P1_PIPECFG_BFRE      (1U << 10)
+#define RA8P1_PIPECFG_TYPE_BULK (1U << 14)
+/* BUFSIZE counts 64-byte blocks minus one; a pipe occupies
+ * (BUFSIZE + 1) * (DBLB + 1) blocks starting at BUFNMB. */
+#define RA8P1_PIPEBUF_BUFNMB(n)  ((uint16_t)((n) & 0xFFU))
+#define RA8P1_PIPEBUF_BUFSIZE(n) ((uint16_t)(((n) & 0x1FU) << 10))
+#define RA8P1_PIPEMAXP_MXPS(n)   ((uint16_t)((n) & 0x7FFU))
+#define RA8P1_PIPECTR_PID_MASK   0x3U
+#define RA8P1_PIPECTR_PID_NAK    0U
+#define RA8P1_PIPECTR_PID_BUF    1U
+#define RA8P1_PIPECTR_PID_STALL  2U
+#define RA8P1_PIPECTR_PBUSY      (1U << 5)
+#define RA8P1_PIPECTR_SQCLR      (1U << 8)
+#define RA8P1_PIPECTR_ACLRM      (1U << 9)
+#define RA8P1_PIPECTR_INBUFM     (1U << 14)
+#define RA8P1_PIPECTR_BSTS       (1U << 15)
+
+/* CFIFOSEL.  ISEL picks the DIRECTION of DCP access and is meaningless for
+ * other pipes; MBW picks the access width, which must agree with the width
+ * of the accesses actually issued to the port. */
+#define RA8P1_CFIFOSEL_CURPIPE(n) ((uint16_t)((n) & 0xFU))
+#define RA8P1_CFIFOSEL_ISEL       (1U << 5)   /* 1 = writing to the buffer  */
+#define RA8P1_CFIFOSEL_BIGEND     (1U << 8)
+#define RA8P1_CFIFOSEL_MBW_8      (0U << 10)
+#define RA8P1_CFIFOSEL_MBW_16     (1U << 10)
+#define RA8P1_CFIFOSEL_MBW_32     (2U << 10)
+#define RA8P1_CFIFOSEL_REW        (1U << 14)
+#define RA8P1_CFIFOSEL_RCNT       (1U << 15)
+
+/* CFIFOCTR */
+#define RA8P1_CFIFOCTR_DTLN_MASK  0xFFFU
+#define RA8P1_CFIFOCTR_FRDY       (1U << 13)
+#define RA8P1_CFIFOCTR_BCLR       (1U << 14)
+#define RA8P1_CFIFOCTR_BVAL       (1U << 15)
+
+/* DCPCTR.  PID is the response the pipe gives: NAK stalls the conversation
+ * politely, BUF answers from the buffer, STALL refuses. */
+#define RA8P1_DCPCTR_PID_MASK   0x3U
+#define RA8P1_DCPCTR_PID_NAK    0U
+#define RA8P1_DCPCTR_PID_BUF    1U
+#define RA8P1_DCPCTR_PID_STALL  2U
+#define RA8P1_DCPCTR_CCPL       (1U << 2)   /* 1 = finish the transfer     */
+#define RA8P1_DCPCTR_PBUSY      (1U << 5)
+#define RA8P1_DCPCTR_SQMON      (1U << 6)
+#define RA8P1_DCPCTR_SQSET      (1U << 7)
+#define RA8P1_DCPCTR_SQCLR      (1U << 8)
+#define RA8P1_DCPCTR_BSTS       (1U << 15)
+
+#define RA8P1_DCPCFG_DIR        (1U << 4)
+#define RA8P1_DCPMAXP_MXPS(n)   ((uint16_t)((n) & 0x7FU))
+
+/* SYSCFG.  DRPD resets to 1 -- those are the HOST pull-downs, so device
+ * mode has to clear a bit rather than merely set the ones it wants. */
+#define RA8P1_SYSCFG_USBE       (1U << 0)
+#define RA8P1_SYSCFG_DPRPU      (1U << 4)   /* D+ pull-up = soft connect    */
+#define RA8P1_SYSCFG_DRPD       (1U << 5)   /* D+/D- pull-downs (host)      */
+#define RA8P1_SYSCFG_DCFM       (1U << 6)   /* 0 = device, 1 = host         */
+#define RA8P1_SYSCFG_HSE        (1U << 7)   /* high-speed operation enable  */
+#define RA8P1_SYSCFG_CNEN       (1U << 8)
+
+/* PHYSET.  DIRPD resets to 1: the transceiver starts POWERED DOWN, so a
+ * bring-up that only sets bits leaves a PHY that answers nothing. */
+#define RA8P1_PHYSET_DIRPD      (1U << 0)   /* 1 = low power                */
+#define RA8P1_PHYSET_PLLRESET   (1U << 1)   /* resets to 1; clear once only */
+#define RA8P1_PHYSET_CDPEN      (1U << 3)
+#define RA8P1_PHYSET_CLKSEL(n)  (((uint16_t)(n) & 0x3U) << 4)
+#define RA8P1_PHYSET_CLKSEL_MASK (0x3U << 4)
+#define RA8P1_PHYSET_CLKSEL_12M 0U
+#define RA8P1_PHYSET_CLKSEL_48M 1U
+#define RA8P1_PHYSET_CLKSEL_20M 2U
+#define RA8P1_PHYSET_CLKSEL_24M 3U          /* this board's crystal         */
+#define RA8P1_PHYSET_REPSTART   (1U << 11)
+#define RA8P1_PHYSET_HSEB       (1U << 15)  /* CL-only mode: NO high speed  */
+
+#define RA8P1_LPSTS_SUSPENDM    (1U << 14)  /* 1 = UTMI normal mode         */
+#define RA8P1_PLLSTA_PLLLOCK    (1U << 0)
+#define RA8P1_SYSSTS0_IDMON     (1U << 2)   /* OTG role: 1 = device      */
+
+/* DVSTCTR0.RHST, read in DEVICE mode: 010 is "bus reset in progress OR
+ * full speed" and 011 is "bus reset in progress OR high speed" -- the same
+ * code covers both, so a speed read during a reset is not yet the answer. */
+#define RA8P1_DVSTCTR0_RHST_MASK 0x7U
+#define RA8P1_DVSTCTR0_RHST_NONE 0U
+#define RA8P1_DVSTCTR0_RHST_FULL 2U
+#define RA8P1_DVSTCTR0_RHST_HIGH 3U
+
+/* INTSTS0 */
+#define RA8P1_INTSTS0_CTSQ_MASK  0x7U
+#define RA8P1_INTSTS0_VALID      (1U << 3)
+#define RA8P1_INTSTS0_DVSQ_SHIFT 4U
+#define RA8P1_INTSTS0_DVSQ_MASK  (0x7U << 4)
+#define RA8P1_INTSTS0_VBSTS      (1U << 7)
+#define RA8P1_INTSTS0_BRDY       (1U << 8)
+#define RA8P1_INTSTS0_NRDY       (1U << 9)
+#define RA8P1_INTSTS0_BEMP       (1U << 10)
+#define RA8P1_INTSTS0_CTRT       (1U << 11)
+#define RA8P1_INTSTS0_DVST       (1U << 12)
+#define RA8P1_INTSTS0_SOFR       (1U << 13)
+#define RA8P1_INTSTS0_RESM       (1U << 14)
+#define RA8P1_INTSTS0_VBINT      (1U << 15)
+
+/* INTENB0 mirrors INTSTS0's upper bits. */
+#define RA8P1_INTENB0_BRDYE      (1U << 8)
+#define RA8P1_INTENB0_NRDYE      (1U << 9)
+#define RA8P1_INTENB0_BEMPE      (1U << 10)
+#define RA8P1_INTENB0_CTRE       (1U << 11)
+#define RA8P1_INTENB0_DVSE       (1U << 12)
+#define RA8P1_INTENB0_SOFE       (1U << 13)
+#define RA8P1_INTENB0_RSME       (1U << 14)
+#define RA8P1_INTENB0_VBSE       (1U << 15)
+
+/** @brief PSEL that selects the OSPI function on any pin (OM_0_* here). */
+#define RA8P1_PFS_PSEL_OSPI     0x1CUL
+#define RA8P1_PFS_PSEL_GLCDC    0x19UL
+
+/** @brief Macronix RDID reply: C2 = manufacturer, then type and density. */
+#define RA8P1_MX_MANUFACTURER   0xC2U
+#define RA8P1_MX_CMD_RDID       0x9FU
+
+/*---------------------------------------------------------------------------*/
+/* External bus / SDRAM controller (UM 15.6)                                 */
+/*                                                                           */
+/* The SDRAM window is 0x6800_0000.  Registers are byte/half/word wide and    */
+/* NOT adjacent -- the offsets below are read off the manual, not strided.    */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_SDRAM_BASE        0x68000000UL   /* the mapped SDRAM window */
+#define RA8P1_BUS_BASE          0x40003000UL
+
+#define RA8P1_SDCCR             (RA8P1_BUS_BASE + 0xC00UL)   /*  8-bit */
+#define RA8P1_SDCMOD            (RA8P1_BUS_BASE + 0xC01UL)   /*  8-bit */
+#define RA8P1_SDAMOD            (RA8P1_BUS_BASE + 0xC02UL)   /*  8-bit */
+#define RA8P1_SDSELF            (RA8P1_BUS_BASE + 0xC10UL)   /*  8-bit */
+#define RA8P1_SDRFCR            (RA8P1_BUS_BASE + 0xC14UL)   /* 16-bit */
+#define RA8P1_SDRFEN            (RA8P1_BUS_BASE + 0xC16UL)   /*  8-bit */
+#define RA8P1_SDICR             (RA8P1_BUS_BASE + 0xC20UL)   /*  8-bit */
+#define RA8P1_SDIR              (RA8P1_BUS_BASE + 0xC24UL)   /* 16-bit */
+#define RA8P1_SDADR             (RA8P1_BUS_BASE + 0xC40UL)   /*  8-bit */
+#define RA8P1_SDTR              (RA8P1_BUS_BASE + 0xC44UL)   /* 32-bit */
+#define RA8P1_SDMOD             (RA8P1_BUS_BASE + 0xC48UL)   /* 16-bit */
+#define RA8P1_SDSR              (RA8P1_BUS_BASE + 0xC50UL)   /*  8-bit */
+
+#define RA8P1_SDCCR_EXENB       (1U << 0)      /* SDRAM access enable      */
+/* BSIZE[1:0] is at 5:4 and 32-bit is 01, NOT 10 -- the ordering is
+ * 16 / 32 / 8, which reads like a typo in the manual and is not. */
+#define RA8P1_SDCCR_BSIZE_16    (0U << 4)
+#define RA8P1_SDCCR_BSIZE_32    (1U << 4)
+#define RA8P1_SDCCR_BSIZE_8     (2U << 4)
+/* MXC[1:0]: the column-address shift.  01 = 9 bits, which is what a 512
+ * column part (A0-A8) needs. */
+#define RA8P1_SDADR_MXC_9BIT    (1U << 0)
+#define RA8P1_SDRFEN_RFEN       (1U << 0)      /* auto-refresh enable      */
+/* Continuous access: hold the row open across consecutive accesses.  OFF at
+ * reset, and writes are IGNORED once EXENB is set -- so it must be enabled in
+ * the config window or every access pays a full ACT/CAS/PRE (~9 BCLK). */
+#define RA8P1_SDAMOD_BE         (1U << 0)
+#define RA8P1_SDICR_INIRQ       (1U << 0)      /* start the init sequencer */
+#define RA8P1_SDSR_INIST        (1U << 3)      /* init sequence running    */
+#define RA8P1_SDSR_MRSST        (1U << 2)
+#define RA8P1_SDSR_SRFST        (1U << 4)
+
+/* SDTR timing, all in SDCLK cycles.  RP/RCD/RAI encode value-minus-one, CL
+ * encodes the value itself, and WR is a plain flag (0 = 1 cycle, 1 = 2). */
+#define RA8P1_SDTR_CL(c)        (((uint32_t)(c) & 0x7UL) << 0)    /*  2:0 */
+#define RA8P1_SDTR_WR_2CYC      (1UL << 8)                        /*    8 */
+#define RA8P1_SDTR_RP(c)        ((((uint32_t)(c) - 1UL) & 0x7UL) << 9)  /* 11:9 */
+#define RA8P1_SDTR_RCD(c)       ((((uint32_t)(c) - 1UL) & 0x3UL) << 12) /* 13:12 */
+#define RA8P1_SDTR_RAI(c)       ((((uint32_t)(c) - 1UL) & 0x7UL) << 16) /* 18:16 */
+
+/* SDIR: initialisation sequencer timing. */
+#define RA8P1_SDIR_ARFI(c)      (((uint16_t)(c) & 0xFU) << 0)     /*  3:0 */
+#define RA8P1_SDIR_ARFC(c)      (((uint16_t)(c) & 0xFU) << 4)     /*  7:4 */
+#define RA8P1_SDIR_PRC(c)       (((uint16_t)(c) & 0x7U) << 8)     /* 10:8 */
+
+/** @brief SDCLK output enable, in the SYSC block rather than the bus one. */
+#define RA8P1_SDCKOCR           (RA8P1_SYSC_BASE + 0x053UL)  /* 8-bit */
+#define RA8P1_SDCKOCR_SDCKOEN   (1U << 0)
+
+/** @brief PSEL value that selects the external-bus function on any pin. */
+#define RA8P1_PFS_PSEL_BUS      0x0BUL
+
+/* PmnPFS.DSCR[1:0] at 11:10.  00 low, 01 middle, 10 HIGH SPEED high drive,
+ * 11 high drive -- note 10 and 11 are not ordered the way they read. */
+#define RA8P1_PFS_DSCR_HS_HIGH  (2UL << 10)
+
+/*---------------------------------------------------------------------------*/
+/* DMA controller (UM 17)                                                    */
+/*                                                                           */
+/* Eight channels, 0x40 apart, plus one global activation register.  Unlike   */
+/* the RSIP the DMAC is fully published, so it is driven directly rather      */
+/* than through a vendor library.                                            */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_DMAC_BASE(n)      (0x4000A000UL + (0x40UL * (n)))
+#define RA8P1_DMAC_DMSAR(n)     (RA8P1_DMAC_BASE(n) + 0x00UL)  /* 32-bit */
+#define RA8P1_DMAC_DMDAR(n)     (RA8P1_DMAC_BASE(n) + 0x04UL)  /* 32-bit */
+#define RA8P1_DMAC_DMCRA(n)     (RA8P1_DMAC_BASE(n) + 0x08UL)  /* 32-bit */
+#define RA8P1_DMAC_DMTMD(n)     (RA8P1_DMAC_BASE(n) + 0x10UL)  /* 16-bit */
+#define RA8P1_DMAC_DMINT(n)     (RA8P1_DMAC_BASE(n) + 0x13UL)  /*  8-bit */
+#define RA8P1_DMAC_DMAMD(n)     (RA8P1_DMAC_BASE(n) + 0x14UL)  /* 16-bit */
+#define RA8P1_DMAC_DMCNT(n)     (RA8P1_DMAC_BASE(n) + 0x1CUL)  /*  8-bit */
+#define RA8P1_DMAC_DMREQ(n)     (RA8P1_DMAC_BASE(n) + 0x1DUL)  /*  8-bit */
+#define RA8P1_DMAC_DMSTS(n)     (RA8P1_DMAC_BASE(n) + 0x1EUL)  /*  8-bit */
+
+/** @brief Global DMAC activation; without DMST no channel runs. */
+#define RA8P1_DMAC_DMAST        0x4000A800UL
+#define RA8P1_DMAC_DMAST_DMST   (1U << 0)
+
+/* DMTMD: mode 15:14, repeat-area select 13:12, transfer size 9:8. */
+#define RA8P1_DMTMD_MD_NORMAL   (0U << 14)
+#define RA8P1_DMTMD_MD_BLOCK    (2U << 14)
+#define RA8P1_DMTMD_SZ_8        (0U << 8)
+#define RA8P1_DMTMD_SZ_16       (1U << 8)
+#define RA8P1_DMTMD_SZ_32       (2U << 8)
+
+/* DMAMD: source mode 15:14, dest mode 7:6.  00 fixed, 10 increment. */
+#define RA8P1_DMAMD_SM_FIXED    (0U << 14)
+#define RA8P1_DMAMD_SM_INC      (2U << 14)
+#define RA8P1_DMAMD_DM_FIXED    (0U << 6)
+#define RA8P1_DMAMD_DM_INC      (2U << 6)
+
+#define RA8P1_DMINT_DTIE        (1U << 4)   /* transfer-end interrupt      */
+#define RA8P1_DMCNT_DTE         (1U << 0)   /* channel enable              */
+#define RA8P1_DMREQ_SWREQ       (1U << 0)   /* software trigger            */
+#define RA8P1_DMREQ_CLRS        (1U << 4)   /* do not auto-clear SWREQ     */
+#define RA8P1_DMSTS_ESIF        (1U << 0)   /* error                       */
+#define RA8P1_DMSTS_DTIF        (1U << 4)   /* transfer end                */
+#define RA8P1_DMSTS_ACT         (1U << 7)   /* channel active              */
+
+/** @brief Module stop: MSTPCRA.MSTPA22 gates the whole DMAC. */
+#define RA8P1_MSTPCRA           (RA8P1_MSTP_BASE + 0x00UL)
+#define RA8P1_MSTPA_DMAC        (1UL << 22)
+
+/*---------------------------------------------------------------------------*/
+/* I/O ports (UM 21.2)                                                       */
+/*                                                                           */
+/* PmnPFS is one 32-bit register per pin: 0x40*m + 4*n from the PFS base,     */
+/* with m = 0..9, A..D.  PWPR_S gates writes to all of them.                 */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_PFS_BASE          0x40400800UL
+#define RA8P1_PFS(m, n)         (RA8P1_PFS_BASE + (0x40UL * (m)) + (4UL * (n)))
+#define RA8P1_PWPR_S            (RA8P1_PFS_BASE + 0x514UL)   /* UM 21.2.8 */
+#define RA8P1_PWPR_PFSWE        (1UL << 6)
+#define RA8P1_PWPR_B0WI         (1UL << 7)
+#define RA8P1_PFS_PSEL_SHIFT    24U                          /* PSEL[28:24] */
+#define RA8P1_PFS_PMR           (1UL << 16)                  /* peripheral  */
+#define RA8P1_PFS_PDR           (1UL << 2)                   /* 1 = output  */
+/* Open drain.  A bus with a pull-up needs the pin to release rather than
+ * drive high, or the line never reads low and every transfer times out. */
+#define RA8P1_PFS_NCODR         (1UL << 6)
+#define RA8P1_PFS_PODR          (1UL << 0)                   /* output data */
+#define RA8P1_PFS_PSEL_SCI      0x04UL                       /* UM Tbl 21.20 */
+
+/*
+ * Port control registers, one 0x20 block per port (UM 21.2.1-21.2.3).  These
+ * are the same direction and data bits as PmnPFS, reachable a whole port at a
+ * time; PCNTR3 in particular gives set and clear as separate write-only
+ * fields, so a pin can be driven without a read-modify-write that could race
+ * an interrupt touching another pin on the same port.
+ */
+#define RA8P1_PORT_BASE(m)      (0x40400000UL + (0x20UL * (m)))
+#define RA8P1_PORT_PCNTR1(m)    (RA8P1_PORT_BASE(m) + 0x00UL) /* PODR|PDR   */
+#define RA8P1_PORT_PCNTR2(m)    (RA8P1_PORT_BASE(m) + 0x04UL) /* EIDR|PIDR  */
+#define RA8P1_PORT_PCNTR3(m)    (RA8P1_PORT_BASE(m) + 0x08UL) /* PORR|POSR  */
+#define RA8P1_PORT_PODR_SHIFT   16U     /* PCNTR1 output data, bits 31:16   */
+#define RA8P1_PORT_PORR_SHIFT   16U     /* PCNTR3 clear,       bits 31:16   */
+#define RA8P1_PORT_MAX          0xDU    /* PORTD; m = 0..9, A..D            */
+
+/*---------------------------------------------------------------------------*/
+/* SCI_B (UM 39; bases from the datasheet's peripheral map)                   */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_SCI_BASE(ch)      (0x40358000UL + (0x100UL * (ch)))
+#define RA8P1_SCI_RDR(ch)       (RA8P1_SCI_BASE(ch) + 0x00UL)
+#define RA8P1_SCI_TDR(ch)       (RA8P1_SCI_BASE(ch) + 0x04UL)
+#define RA8P1_SCI_CCR0(ch)      (RA8P1_SCI_BASE(ch) + 0x08UL)
+#define RA8P1_SCI_CCR1(ch)      (RA8P1_SCI_BASE(ch) + 0x0CUL)
+#define RA8P1_SCI_CCR2(ch)      (RA8P1_SCI_BASE(ch) + 0x10UL)
+#define RA8P1_SCI_CCR3(ch)      (RA8P1_SCI_BASE(ch) + 0x14UL)
+#define RA8P1_SCI_CSR(ch)       (RA8P1_SCI_BASE(ch) + 0x48UL)
+#define RA8P1_SCI_CFCLR(ch)     (RA8P1_SCI_BASE(ch) + 0x68UL)
+#define RA8P1_SCI_CFCLR_ORERC   (1UL << 24)
+#define RA8P1_SCI_CCR0_RE       (1UL << 0)
+#define RA8P1_SCI_CCR0_TE       (1UL << 4)
+#define RA8P1_SCI_CCR0_RIE      (1UL << 16)  /* receive interrupt enable */
+#define RA8P1_SCI_CSR_ORER      (1UL << 24)
+#define RA8P1_SCI_CSR_TDRE      (1UL << 29)
+#define RA8P1_SCI_CSR_TEND      (1UL << 30)
+#define RA8P1_SCI_CSR_RDRF      (1UL << 31)
+
+/*
+ * CCR2 carries the baud divisor.  MDDR (31:24) and BCP (2:0) keep their reset
+ * values; ABCSE2/ABCSE/ABCS/BGDM all zero select the x16 base clock, which is
+ * what the manual's BRR tables (UM Table 39.11) are computed for.
+ */
+#define RA8P1_SCI_CCR2_BASE     0xFF000004UL
+#define RA8P1_SCI_CCR2_BRR(n)   (((uint32_t)(n) & 0xFFUL) << 8)
+#define RA8P1_SCI_CCR2_CKS(n)   (((uint32_t)(n) & 0x03UL) << 20)
+
+/*---------------------------------------------------------------------------*/
+/* ICU event link (UM 14.2.17)                                               */
+/*                                                                           */
+/* Peripheral interrupts do NOT have fixed NVIC slots on this family: any of  */
+/* the 96 slots can carry any event, and IELSRn says which.  Nothing reaches  */
+/* the NVIC until its slot is linked -- which is why SysTick, a core          */
+/* exception, was the tick that needed none of this.                          */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_ICU_BASE          0x4000C000UL
+#define RA8P1_ICU_IELSR(n)      (RA8P1_ICU_BASE + 0x300UL + (4UL * (n)))
+#define RA8P1_ICU_IELSR_IR      (1UL << 16)   /* interrupt status, write 0 */
+
+/*
+ * Slot allocation.  Any of the 96 slots can carry any event, so nothing stops
+ * two drivers picking the same one and each silently stealing the other's
+ * interrupt.  The map lives here, once, rather than as a private #define in
+ * each driver -- it is a system-wide resource, and the wake-source reporter
+ * has to read it too.
+ */
+#define RA8P1_ICU_SLOT_UART_RXI 0U
+#define RA8P1_ICU_SLOT_UART_ERI 1U
+#define RA8P1_ICU_SLOT_HTIMER   2U
+#define RA8P1_ICU_SLOT_DMAC0    3U
+#define RA8P1_ICU_SLOT_USBHS    4U
+#define RA8P1_ICU_SLOT_IPC      5U
+#define RA8P1_ICU_SLOT_NPU      6U
+
+/** @brief Event numbers this port links (UM Table 14.5). */
+#define RA8P1_EVENT_SCI8_RXI    0x2FCUL
+#define RA8P1_EVENT_SCI8_ERI    0x2FFUL
+#define RA8P1_EVENT_GPT0_CCMPA  0x181UL
+#define RA8P1_EVENT_DMAC0_INT   0x040UL
+/* One event carries every USB source -- VBUS, resume, frame, device state,
+ * control stage, BRDY, BEMP -- so the handler must drain INTSTS0 rather than
+ * assume one cause per edge.  0x2C1/0x2C2 are the D0/D1FIFO DMA requests,
+ * which this port does not use. */
+#define RA8P1_EVENT_USBHS_USBIR 0x2C3UL
+#define RA8P1_EVENT_IPC_IRQ0    0x05BUL
+
+/*---------------------------------------------------------------------------*/
+/* GPT32 (UM 23) -- the htimer's counter and compare                          */
+/*                                                                            */
+/* A 32-bit free-running counter on PCLKD with a compare that raises an event. */
+/* Note GTINTAD carries NO per-compare interrupt enable (bits 7:0 reserved):   */
+/* the compare always raises its event and the ICU decides whether it reaches  */
+/* the NVIC, which is the event-link architecture doing the gating.            */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_GPT_BASE(n)       (0x40322000UL + (0x100UL * (n)))
+#define RA8P1_GPT_GTCR(n)       (RA8P1_GPT_BASE(n) + 0x2CUL)
+#define RA8P1_GPT_GTST(n)       (RA8P1_GPT_BASE(n) + 0x3CUL)
+#define RA8P1_GPT_GTCNT(n)      (RA8P1_GPT_BASE(n) + 0x48UL)
+#define RA8P1_GPT_GTCCRA(n)     (RA8P1_GPT_BASE(n) + 0x4CUL)
+#define RA8P1_GPT_GTPR(n)       (RA8P1_GPT_BASE(n) + 0x64UL)
+#define RA8P1_GPT_GTWP(n)       (RA8P1_GPT_BASE(n) + 0x00UL)
+#define RA8P1_GPT_GTIOR(n)      (RA8P1_GPT_BASE(n) + 0x34UL)
+#define RA8P1_GPT_GTUDDTYC(n)   (RA8P1_GPT_BASE(n) + 0x30UL)
+
+/* GTWP drops every other write until the key opens it. */
+#define RA8P1_GPT_GTWP_KEY      0xA500UL
+
+/* GTIOR.GTIOA[4:0]: initial level, cycle-end action, compare-match action.
+ * 0x09 = start low, high at compare match, low at cycle end -- a square-ish
+ * clock whose consumer PLL does not mind the duty.  OAE gates the pin. */
+#define RA8P1_GPT_GTIOA_CLK     0x09UL
+#define RA8P1_GPT_GTIOR_OAE     (1UL << 8)
+
+/** @brief Module stop: MSTPCRE.MSTPE19 gates GPT channel 12 (camera XCLK). */
+#define RA8P1_MSTPCRE_GPT12     (1UL << 19)
+
+/** @brief Pin function select for the GPT outputs. */
+#define RA8P1_PFS_PSEL_GPT      0x03UL
+#define RA8P1_GPT_GTCR_CST      (1UL << 0)     /* count start          */
+/*
+ * GTCLKCR must be written BEFORE the module-stop release and is locked once
+ * MSTPE31 is 0 (UM 23.10.1).  BPEN=1 selects the synchronous PCLKD core
+ * clock; the reset default is the ASYNC GPTCLK domain, and with GPTCLK at
+ * the 8 MHz MOCO against a 120 MHz PCLKA bus the synchroniser drops every
+ * register write -- the block reads as zeros and takes nothing.
+ */
+#define RA8P1_GPT_GTCLKCR       0x40323F10UL
+#define RA8P1_GPT_GTCLKCR_BPEN  (1UL << 0)
+#define RA8P1_GPT_GTCR_MD_SAW   (0UL << 16)    /* saw-wave PWM mode 1  */
+#define RA8P1_GPT_GTST_TCFA     (1UL << 0)     /* compare match A      */
+
+#define RA8P1_MSTPCRE           (RA8P1_MSTP_BASE + 0x10UL)  /* UM 11.2.10 */
+#define RA8P1_GPTCKDIVCR        (RA8P1_SYSC_BASE + 0x05CUL)  /* 8-bit */
+#define RA8P1_GPTCKCR           (RA8P1_SYSC_BASE + 0x05DUL)  /* 8-bit */
+#define RA8P1_MSTPE_GPT0        (1UL << 31)
+
+/*---------------------------------------------------------------------------*/
+/* Code MRAM programming (UM 60.4.2)                                         */
+/*                                                                           */
+/* No bootrom and no erase: an ordinary STR to an MRAM address enters a      */
+/* 32-byte program buffer, which commits when it fills, when a write leaves  */
+/* its 32-byte boundary, or on an explicit MRCFL flush.  Writes of 1..31     */
+/* bytes are legal -- barrier, then flush.  MRCPC1, MRCBPROT1 and MRCFLR are */
+/* key-gated and must be written 16 bits at a time or the write is dropped;  */
+/* MRPSC and MRCPS are plain 8-bit and carry no key.                         */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_MRAM_REG_BASE     0x4013C000UL
+#define RA8P1_MRPSC             (RA8P1_MRAM_REG_BASE + 0x2800UL) /* 8-bit  */
+#define RA8P1_MRPSC_MHSPEN      (1U << 0)   /* high-speed program mode     */
+#define RA8P1_MRCPS             (RA8P1_MRAM_REG_BASE + 0x3010UL) /* 8-bit  */
+#define RA8P1_MRCPS_PRGERRC     (1U << 0)
+#define RA8P1_MRCPS_ECCERRC     (1U << 1)
+#define RA8P1_MRCPS_ABUFEMP     (1U << 5)
+#define RA8P1_MRCPS_ABUFFULL    (1U << 6)
+#define RA8P1_MRCPS_PRGBSYC     (1U << 7)
+/*
+ * Programming the SECURE alias needs MRCPSEN, and it outranks block
+ * protection -- a store without it is not dropped, it BUS FAULTS.  Each
+ * register carries its own key and must be written 16 bits at a time.
+ * BPCN1 is ignored unless MRCPSEN is already 1, so the order is fixed.
+ */
+#define RA8P1_MRCPC1            (RA8P1_MRAM_REG_BASE + 0x3004UL) /* 16-bit */
+#define RA8P1_MRCPC1_KEY        0x6800U
+#define RA8P1_MRCPC1_MRCPSEN    (1U << 0)
+#define RA8P1_MRCBPROT1         (RA8P1_MRAM_REG_BASE + 0x300CUL) /* 16-bit */
+#define RA8P1_MRCBPROT1_KEY     0xB100U
+#define RA8P1_MRCBPROT1_BPCN1   (1U << 0)
+#define RA8P1_MRCFLR            (RA8P1_MRAM_REG_BASE + 0x3030UL) /* 16-bit */
+#define RA8P1_MRCFLR_KEY        0xC300U
+#define RA8P1_MRCFLR_MRCFL      (1U << 0)
+/** @brief Program granule: buffer width, and the MPU/cache line width too. */
+#define RA8P1_MRAM_GRANULE      32UL
+
+/*---------------------------------------------------------------------------*/
+/* CAC (UM 10, "Clock Frequency Accuracy Measurement Circuit")                */
+/*                                                                           */
+/* Counts one clock against another entirely on-chip, which is the only way   */
+/* to state this port's clock rate without appealing to a host stopwatch.     */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_CAC_BASE          0x40202400UL
+#define RA8P1_CACR0             (RA8P1_CAC_BASE + 0x00UL)   /* 8-bit  */
+#define RA8P1_CACR1             (RA8P1_CAC_BASE + 0x01UL)   /* 8-bit  */
+#define RA8P1_CACR2             (RA8P1_CAC_BASE + 0x02UL)   /* 8-bit  */
+#define RA8P1_CAICR             (RA8P1_CAC_BASE + 0x03UL)   /* 8-bit  */
+#define RA8P1_CASTR             (RA8P1_CAC_BASE + 0x04UL)   /* 8-bit  */
+#define RA8P1_CAULVR            (RA8P1_CAC_BASE + 0x06UL)   /* 16-bit */
+#define RA8P1_CALLVR            (RA8P1_CAC_BASE + 0x08UL)   /* 16-bit */
+#define RA8P1_CACNTBR           (RA8P1_CAC_BASE + 0x0AUL)   /* 16-bit */
+#define RA8P1_CACR0_CFME        (1U << 0)
+#define RA8P1_CACR1_FMCS(n)     (((n) & 0x7U) << 1)   /* target clock  */
+/* RPS selects WHERE the reference comes from, and 0 is the external CACREF
+ * PIN -- an internal clock needs it set.  Left clear, the measurement simply
+ * never completes and the count reads 0. */
+#define RA8P1_CACR2_RPS_INT     (1U << 0)
+#define RA8P1_CACR2_RSCS(n)     (((n) & 0x7U) << 1)   /* reference     */
+#define RA8P1_CACR2_RCDS(n)     (((n) & 0x3U) << 4)   /* ref divider   */
+#define RA8P1_CASTR_FERRF       (1U << 0)
+#define RA8P1_CASTR_MENDF       (1U << 1)
+#define RA8P1_CASTR_OVFF        (1U << 2)
+#define RA8P1_CAICR_FERRFCL     (1U << 4)
+#define RA8P1_CAICR_MENDFCL     (1U << 5)
+#define RA8P1_CAICR_OVFFCL      (1U << 6)
+/** @brief CAC clock selects, shared by FMCS and RSCS (UM 10.2.2, 10.2.3). */
+#define RA8P1_CAC_CLK_MAIN      0U
+#define RA8P1_CAC_CLK_SUB       1U
+#define RA8P1_CAC_CLK_HOCO      2U
+#define RA8P1_CAC_CLK_MOCO      3U
+#define RA8P1_CAC_CLK_LOCO      4U
+#define RA8P1_CAC_CLK_PCLKB     5U
+
+#define RA8P1_MSTPCRC           (RA8P1_MSTP_BASE + 0x08UL)  /* UM 11.2.8 */
+#define RA8P1_MSTPC_CAC         (1UL << 0)
+
+/*---------------------------------------------------------------------------*/
+/* IWDT (UM 29, "Independent Watchdog Timer")                                */
+/*                                                                           */
+/* Counts IWDTCLK = LOCO/2 = 16.384 kHz, which is why this and not WDT is the */
+/* kernel's watchdog: WDT counts PCLKB and so would need re-arming whenever   */
+/* the clock tree moves.  OFS0 reads 0xFFFFFFFF on this board -- MEASURED --  */
+/* so IWDTSTRT is 1: register start mode, counting begins on first refresh.   */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_IWDT_BASE         0x40202200UL
+#define RA8P1_IWDT_RR           (RA8P1_IWDT_BASE + 0x00UL)  /* 8-bit  */
+#define RA8P1_IWDT_CR           (RA8P1_IWDT_BASE + 0x02UL)  /* 16-bit */
+#define RA8P1_IWDT_SR           (RA8P1_IWDT_BASE + 0x04UL)  /* 16-bit */
+#define RA8P1_IWDT_CR_TOPS(n)   (((uint16_t)(n) & 0x3U) << 0)
+#define RA8P1_IWDT_CR_CKS(n)    (((uint16_t)(n) & 0xFU) << 4)
+#define RA8P1_IWDT_CR_RPES_NONE (0x3U << 8)   /* no window end   */
+#define RA8P1_IWDT_CR_RPSS_NONE (0x3U << 12)  /* no window start */
+/** @brief IWDTCLK in Hz: the LOCO, always divided by two (UM 9.10.32). */
+#define RA8P1_IWDTCLK_HZ        16384UL
+
+/*---------------------------------------------------------------------------*/
+/* WDT0/WDT1 (UM 28, "Watchdog Timer")                                       */
+/*                                                                           */
+/* Two instances 0x100 apart: WDT0 for CPU0, WDT1 for CPU1 (the M33 the      */
+/* coprocessor runs).  WDT1 supervises the payload -- the payload refreshes  */
+/* it each loop pass, and a hang (spin with interrupts masked) stops the     */
+/* refresh, underflows, and fires an NMI to CPU1.  Register-start mode:      */
+/* OFS3 reads 0xFFFFFFFF on this board (MEASURED, like OFS0), so WDTSTRT1 is  */
+/* 1 and the config lives in these runtime registers, no option-memory write.*/
+/* WDTCR/WDTRR/WDTSR need their documented access width; a 32-bit AHB read of */
+/* the block returns bus-dependent bytes (why a raw dump does not match).     */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_WDT1_BASE         0x40202700UL
+#define RA8P1_WDT1_RR           (RA8P1_WDT1_BASE + 0x00UL)  /* 8-bit  refresh */
+#define RA8P1_WDT1_CR           (RA8P1_WDT1_BASE + 0x02UL)  /* 16-bit control */
+#define RA8P1_WDT1_SR           (RA8P1_WDT1_BASE + 0x04UL)  /* 16-bit status  */
+#define RA8P1_WDT1_RCR          (RA8P1_WDT1_BASE + 0x06UL)  /* 8-bit  reset   */
+
+/* WDTCR fields.  0x33F3 (reset) = TOPS 16384 x CKS /128, no window.  For hang
+ * supervision the counter must outlast the longest single payload op (the
+ * ~1 s verify batch), so CKS is widened to /8192: TOPS 16384 x 8192 at
+ * PCLKB <= 62.5 MHz is ~2.1 s. */
+#define RA8P1_WDT1_CR_TOPS_16384 (0x3U << 0)
+#define RA8P1_WDT1_CR_CKS_8192   (0x8U << 4)
+#define RA8P1_WDT1_CR_RPES_NONE  (0x3U << 8)   /* window end 0%   */
+#define RA8P1_WDT1_CR_RPSS_NONE  (0x3U << 12)  /* window start 100% */
+
+/* WDTRCR.RSTIRQS bit 7: 0 = interrupt (the NMI), 1 = reset.  Reset value is 1,
+ * so this must be cleared to keep an underflow off the system-reset path. */
+#define RA8P1_WDT1_RCR_RSTIRQS   (1U << 7)
+
+/* WDTSR flags. */
+#define RA8P1_WDT1_SR_UNDFF      (1U << 14)  /* underflow            */
+#define RA8P1_WDT1_SR_REFEF      (1U << 15)  /* refresh error        */
+
+/*
+ * ICU NMI block (UM 14).  ICU0 and ICU1 share this base; each CPU sees its
+ * own, so CPU1's payload writes these to reach ICU1.  WDT underflow/refresh
+ * error is bit 1 in each.
+ */
+#define RA8P1_ICU_NMIER         (RA8P1_ICU_BASE + 0x100UL)  /* enable */
+#define RA8P1_ICU_NMICLR        (RA8P1_ICU_BASE + 0x110UL)  /* clear  */
+#define RA8P1_ICU_NMISR         (RA8P1_ICU_BASE + 0x120UL)  /* status */
+#define RA8P1_ICU_NMI_WDT       (1UL << 1)   /* WDTEN / WDTCLR / WDTST */
+
+/*---------------------------------------------------------------------------*/
+/* GLCDC -- graphics LCD controller (UM 64)                                  */
+/*                                                                           */
+/* Shares the graphics power domain with the DRW, so PDCTRGD must be open    */
+/* before any of this answers.  Timing is generated by the background plane: */
+/* the frame rate is LCDCLK / (BG_PERI.FH * BG_PERI.FV), which makes a       */
+/* measured rate a check on the clock and the timing registers together.     */
+/*                                                                           */
+/* Register writes are staged: they only take effect when a VEN bit is set,  */
+/* so a configuration written without the reflect step is simply ignored.    */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_GLCDC_BASE        0x40342000UL
+#define RA8P1_GLCDC_BG_EN       (RA8P1_GLCDC_BASE + 0x1000UL)
+#define RA8P1_GLCDC_BG_PERI     (RA8P1_GLCDC_BASE + 0x1004UL)
+#define RA8P1_GLCDC_BG_SYNC     (RA8P1_GLCDC_BASE + 0x1008UL)
+#define RA8P1_GLCDC_BG_VSIZE    (RA8P1_GLCDC_BASE + 0x100CUL)
+#define RA8P1_GLCDC_BG_HSIZE    (RA8P1_GLCDC_BASE + 0x1010UL)
+#define RA8P1_GLCDC_BG_BGC      (RA8P1_GLCDC_BASE + 0x1014UL)
+#define RA8P1_GLCDC_BG_MON      (RA8P1_GLCDC_BASE + 0x1018UL)
+
+#define RA8P1_GLCDC_BG_EN_EN    (1UL << 0)
+#define RA8P1_GLCDC_BG_EN_VEN   (1UL << 8)
+#define RA8P1_GLCDC_BG_EN_SWRST (1UL << 16)
+#define RA8P1_GLCDC_BG_MON_EN   (1UL << 0)
+
+/* Graphics layers, n = 1 or 2. */
+#define RA8P1_GLCDC_GR(n, off)  (RA8P1_GLCDC_BASE + 0x1100UL + \
+                                 (0x100UL * ((n) - 1UL)) + (off))
+#define RA8P1_GLCDC_GR_VEN(n)   RA8P1_GLCDC_GR(n, 0x00UL)
+#define RA8P1_GLCDC_GR_FLMRD(n) RA8P1_GLCDC_GR(n, 0x04UL)
+#define RA8P1_GLCDC_GR_FLM1(n)  RA8P1_GLCDC_GR(n, 0x08UL)
+#define RA8P1_GLCDC_GR_FLM2(n)  RA8P1_GLCDC_GR(n, 0x0CUL)  /* base address */
+#define RA8P1_GLCDC_GR_FLM3(n)  RA8P1_GLCDC_GR(n, 0x10UL)  /* line offset  */
+#define RA8P1_GLCDC_GR_FLM5(n)  RA8P1_GLCDC_GR(n, 0x18UL)  /* per-line/num */
+#define RA8P1_GLCDC_GR_FLM6(n)  RA8P1_GLCDC_GR(n, 0x1CUL)  /* format       */
+#define RA8P1_GLCDC_GR_AB1(n)   RA8P1_GLCDC_GR(n, 0x20UL)
+#define RA8P1_GLCDC_GR_AB2(n)   RA8P1_GLCDC_GR(n, 0x24UL)  /* vert window */
+#define RA8P1_GLCDC_GR_AB3(n)   RA8P1_GLCDC_GR(n, 0x28UL)  /* horiz window */
+#define RA8P1_GLCDC_OUT_BRIGHT1 (RA8P1_GLCDC_BASE + 0x13C8UL)
+#define RA8P1_GLCDC_OUT_BRIGHT2 (RA8P1_GLCDC_BASE + 0x13CCUL)
+#define RA8P1_GLCDC_OUT_CONTRAST (RA8P1_GLCDC_BASE + 0x13D0UL)
+#define RA8P1_GLCDC_GR_MON(n)   RA8P1_GLCDC_GR(n, 0x54UL)
+
+#define RA8P1_GLCDC_GR_VEN_PVEN   (1UL << 0)
+#define RA8P1_GLCDC_GR_FLMRD_RENB (1UL << 0)
+#define RA8P1_GLCDC_GR_FLM6_RGB565 (0UL << 28)  /* FORMAT[2:0] = 000 */
+/* DISPSEL 11 blends this layer over what is beneath it; 01 passes the lower
+ * layer through untouched; 00 -- the RESET VALUE -- paints the layer's own
+ * base colour, black, over everything beneath.  Layer 2 sits above layer 1
+ * in the blend chain, so a start that configures only layer 1 must set
+ * layer 2 to pass-through or the finished image is composited to black. */
+#define RA8P1_GLCDC_GR_AB1_DISPSEL_FB   (3UL << 0)
+#define RA8P1_GLCDC_GR_AB1_DISPSEL_PASS (1UL << 0)
+
+/* Output correction is a MULTIPLY, and its reset value is zero: left alone,
+ * every pixel is scaled to black and the panel shows nothing while every
+ * other register reads correct.  0x80 per channel is unity, 512 is the
+ * brightness midpoint. */
+#define RA8P1_GLCDC_CONTRAST_UNITY  0x00808080UL
+#define RA8P1_GLCDC_BRIGHT_MID      512UL
+
+/* System control: detection arm, interrupt enable, status and its clear.
+ * The flag does not set unless the matching DTCTEN bit is armed first. */
+/* Timing-controller outputs.  The A pair carries the sync pulses and the B
+ * pair the data-enable window; SEL in each x2 register routes the signal to a
+ * physical TCON pin.  Without these the panel gets pixels and a clock but no
+ * valid sync or DE, and shows nothing at all. */
+#define RA8P1_GLCDC_OUT_VLATCH  (RA8P1_GLCDC_BASE + 0x13C0UL)
+#define RA8P1_GLCDC_OUT_SET     (RA8P1_GLCDC_BASE + 0x13C4UL)
+#define RA8P1_GLCDC_TCON_TIM    (RA8P1_GLCDC_BASE + 0x1404UL)
+#define RA8P1_GLCDC_TCON_STVA1  (RA8P1_GLCDC_BASE + 0x1408UL)
+#define RA8P1_GLCDC_TCON_STVA2  (RA8P1_GLCDC_BASE + 0x140CUL)
+#define RA8P1_GLCDC_TCON_STVB1  (RA8P1_GLCDC_BASE + 0x1410UL)
+#define RA8P1_GLCDC_TCON_STVB2  (RA8P1_GLCDC_BASE + 0x1414UL)
+#define RA8P1_GLCDC_TCON_STHA1  (RA8P1_GLCDC_BASE + 0x1418UL)
+#define RA8P1_GLCDC_TCON_STHA2  (RA8P1_GLCDC_BASE + 0x141CUL)
+#define RA8P1_GLCDC_TCON_STHB1  (RA8P1_GLCDC_BASE + 0x1420UL)
+#define RA8P1_GLCDC_TCON_STHB2  (RA8P1_GLCDC_BASE + 0x1424UL)
+#define RA8P1_GLCDC_TCON_DE     (RA8P1_GLCDC_BASE + 0x1428UL)
+
+#define RA8P1_GLCDC_SYS_DTCTEN  (RA8P1_GLCDC_BASE + 0x1440UL)
+#define RA8P1_GLCDC_SYS_INTEN   (RA8P1_GLCDC_BASE + 0x1444UL)
+#define RA8P1_GLCDC_SYS_STCLR   (RA8P1_GLCDC_BASE + 0x1448UL)
+#define RA8P1_GLCDC_SYS_STMON   (RA8P1_GLCDC_BASE + 0x144CUL)
+#define RA8P1_GLCDC_SYS_PANELCLK (RA8P1_GLCDC_BASE + 0x1450UL)
+#define RA8P1_GLCDC_SYS_VPOS    (1UL << 0)
+#define RA8P1_GLCDC_SYS_L1UNDF  (1UL << 1)
+#define RA8P1_GLCDC_SYS_L2UNDF  (1UL << 2)
+#define RA8P1_GLCDC_PANELCLK_EN     (1UL << 6)   /* clock output enable    */
+#define RA8P1_GLCDC_PANELCLK_LCDCLK (1UL << 8)   /* 0 selects LCD_EXTCLK   */
+/* DCDR is the panel-clock divider and zero is not a ratio: left at reset the
+ * controller has no pixel clock, accepts every other write, and simply never
+ * generates a frame.  CLKEN must be low while DCDR or CLKSEL change. */
+#define RA8P1_GLCDC_PANELCLK_DCDR(n) ((uint32_t)(n) & 0x3FUL)
+
+/* LCDCKCR source codes beyond MOCO; PLL1P is the core's own source, so it is
+ * running at every rung and needs no PLL of its own to be brought up. */
+#define RA8P1_LCDCKCR_SEL_PLL1P 0x5U
+#define RA8P1_LCDCKDIV_4        0x2U
+
+/*
+ * LCDCLK (UM 9.2.53/9.2.58).  Changing source or divider is a handshake, not
+ * a write: request, wait for ready, write, release.  A bare divider write is
+ * the silent-failure shape this port keeps meeting.  Reset source is MOCO.
+ */
+#define RA8P1_LCDCKDIVCR        (RA8P1_SYSC_BASE + 0x05EUL)   /* 8-bit */
+#define RA8P1_LCDCKCR           (RA8P1_SYSC_BASE + 0x05FUL)   /* 8-bit */
+#define RA8P1_LCDCKCR_SEL_MOCO  0x1U
+#define RA8P1_LCDCKCR_SREQ      (1U << 6)
+#define RA8P1_LCDCKCR_SRDY      (1U << 7)
+
+/*---------------------------------------------------------------------------*/
+/* IIC -- I2C bus interface (UM 40)                                          */
+/*                                                                           */
+/* Three channels 0x100 apart.  The camera and touch controller on the       */
+/* expansion boards share channel 1: SCL1 on P512, SDA1 on P511, both at     */
+/* peripheral select 00111b.                                                 */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_IIC_BASE(n)       (0x4025E000UL + (0x100UL * (n)))
+#define RA8P1_IIC_CCR1(n)       (RA8P1_IIC_BASE(n) + 0x00UL)
+#define RA8P1_IIC_CCR2(n)       (RA8P1_IIC_BASE(n) + 0x01UL)
+#define RA8P1_IIC_MR1(n)        (RA8P1_IIC_BASE(n) + 0x02UL)
+#define RA8P1_IIC_MR2(n)        (RA8P1_IIC_BASE(n) + 0x03UL)
+#define RA8P1_IIC_MR3(n)        (RA8P1_IIC_BASE(n) + 0x04UL)
+#define RA8P1_IIC_FER(n)        (RA8P1_IIC_BASE(n) + 0x05UL)
+#define RA8P1_IIC_SER(n)        (RA8P1_IIC_BASE(n) + 0x06UL)
+#define RA8P1_IIC_IER(n)        (RA8P1_IIC_BASE(n) + 0x07UL)
+#define RA8P1_IIC_SR1(n)        (RA8P1_IIC_BASE(n) + 0x08UL)
+#define RA8P1_IIC_SR2(n)        (RA8P1_IIC_BASE(n) + 0x09UL)
+#define RA8P1_IIC_BRL(n)        (RA8P1_IIC_BASE(n) + 0x10UL)
+#define RA8P1_IIC_BRH(n)        (RA8P1_IIC_BASE(n) + 0x11UL)
+#define RA8P1_IIC_DRT(n)        (RA8P1_IIC_BASE(n) + 0x12UL)
+#define RA8P1_IIC_DRR(n)        (RA8P1_IIC_BASE(n) + 0x13UL)
+
+/* ICCR1: ICE enables the unit, IICRST resets it; the two together choose
+ * between a full reset and an internal one, so both are written explicitly. */
+#define RA8P1_IIC_CCR1_ICE      (1U << 7)
+#define RA8P1_IIC_CCR1_IICRST   (1U << 6)
+#define RA8P1_IIC_CCR1_SOWP     (1U << 4)
+
+/* ICCR2: the condition requests, and who drives the bus. */
+#define RA8P1_IIC_CCR2_ST       (1U << 1)
+#define RA8P1_IIC_CCR2_RS       (1U << 2)
+#define RA8P1_IIC_CCR2_SP       (1U << 3)
+#define RA8P1_IIC_CCR2_TRS      (1U << 5)
+#define RA8P1_IIC_CCR2_MST      (1U << 6)
+#define RA8P1_IIC_CCR2_BBSY     (1U << 7)
+
+/* ICSR2 flags.  NACKF is the one that matters most: a device that is absent
+ * answers nothing, and without checking it a transfer "succeeds" silently. */
+#define RA8P1_IIC_SR2_TMOF      (1U << 0)
+#define RA8P1_IIC_SR2_AL        (1U << 1)
+#define RA8P1_IIC_SR2_START     (1U << 2)
+#define RA8P1_IIC_SR2_STOP      (1U << 3)
+#define RA8P1_IIC_SR2_NACKF     (1U << 4)
+#define RA8P1_IIC_SR2_RDRF      (1U << 5)
+#define RA8P1_IIC_SR2_TEND      (1U << 6)
+#define RA8P1_IIC_SR2_TDRE      (1U << 7)
+
+/* ICMR3: WAIT holds the clock before the last byte so the master can send a
+ * NACK; RDRFS makes the receive flag rise at the right moment for that. */
+#define RA8P1_IIC_MR3_ACKBT     (1U << 3)
+#define RA8P1_IIC_MR3_ACKWP     (1U << 4)
+#define RA8P1_IIC_MR3_RDRFS     (1U << 5)
+#define RA8P1_IIC_MR3_WAIT      (1U << 6)
+
+/** @brief Module stop: MSTPCRB.MSTPB8 gates IIC1 (MSTPB9 is IIC0). */
+#define RA8P1_MSTPCRB_IIC1      (1UL << 8)
+
+/** @brief Pin function select for the IIC peripheral. */
+#define RA8P1_PFS_PSEL_IIC      0x07UL
+
+/*---------------------------------------------------------------------------*/
+/* DRW -- 2D drawing engine (UM 63)                                          */
+/*                                                                           */
+/* A D/AVE-class rasteriser: up to six "limiters" each describe a half plane */
+/* as a decision value that steps by a per-x and per-y increment across a    */
+/* bounding box; their intersection is the shape, and the clamped result is  */
+/* the pixel alpha.  The CPU computes the corner value and the increments.   */
+/*                                                                           */
+/* TWO TRAPS, both silent:                                                   */
+/*  - Offsets 0x00 and 0x04 are DIFFERENT registers by direction.  Writing   */
+/*    0x00 sets CONTROL, reading it returns STATUS; 0x04 is CONTROL2 for a   */
+/*    write and HWREVISION for a read.  A read-modify-write on either feeds  */
+/*    status bits back as control, so both are write-only shadows here.      */
+/*  - ORIGIN is the TRIGGER (UM 63.7.1): writing it starts the render, so it */
+/*    must be written LAST, after every other register is already set.       */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_DRW_BASE          0x40444000UL
+#define RA8P1_DRW_CONTROL       (RA8P1_DRW_BASE + 0x00UL)  /* W */
+#define RA8P1_DRW_STATUS        (RA8P1_DRW_BASE + 0x00UL)  /* R */
+#define RA8P1_DRW_CONTROL2      (RA8P1_DRW_BASE + 0x04UL)  /* W */
+#define RA8P1_DRW_HWREVISION    (RA8P1_DRW_BASE + 0x04UL)  /* R */
+#define RA8P1_DRW_LSTART(n)     (RA8P1_DRW_BASE + 0x10UL + (4UL * (n)))
+#define RA8P1_DRW_LXADD(n)      (RA8P1_DRW_BASE + 0x28UL + (4UL * (n)))
+#define RA8P1_DRW_LYADD(n)      (RA8P1_DRW_BASE + 0x40UL + (4UL * (n)))
+#define RA8P1_DRW_COLOR1        (RA8P1_DRW_BASE + 0x64UL)
+#define RA8P1_DRW_COLOR2        (RA8P1_DRW_BASE + 0x68UL)
+#define RA8P1_DRW_PATTERN       (RA8P1_DRW_BASE + 0x74UL)
+#define RA8P1_DRW_SIZE          (RA8P1_DRW_BASE + 0x78UL)
+#define RA8P1_DRW_PITCH         (RA8P1_DRW_BASE + 0x7CUL)
+#define RA8P1_DRW_ORIGIN        (RA8P1_DRW_BASE + 0x80UL)  /* W: STARTS render */
+#define RA8P1_DRW_IRQCTL        (RA8P1_DRW_BASE + 0xC0UL)
+#define RA8P1_DRW_CACHECTL      (RA8P1_DRW_BASE + 0xC4UL)
+#define RA8P1_DRW_DLISTSTART    (RA8P1_DRW_BASE + 0xC8UL)
+#define RA8P1_DRW_COLKEY        (RA8P1_DRW_BASE + 0xE8UL)
+
+/* CONTROL: one enable per limiter, bits 0..5.  A QUAD bit couples a pair of
+ * limiters into one quadratic, which is how the engine draws a circle: the
+ * first of the pair carries the value and its x/y steps, the second carries
+ * the steps' own steps (UM 63.6.2.2). */
+#define RA8P1_DRW_CTL_LIMEN(n)  (1UL << (n))
+#define RA8P1_DRW_CTL_QUAD1     (1UL << 6)   /* couples limiters 1 and 2 */
+
+/* CONTROL2: framebuffer format lives in bit 8 and bits 21:20 together --
+ * 0b001 selects 16 bpp RGB565, which is the format this port renders in. */
+#define RA8P1_DRW_CTL2_WRFMT_RGB565  (1UL << 20)
+
+/*
+ * Blending is src*SF + dst*DF, and BOTH factors default to 1.0 -- so a fill
+ * left at reset ADDS to what is already there.  Over a black destination that
+ * is indistinguishable from replacing it, which is exactly how it hides.
+ *
+ * Taking both factors from the limiters' alpha gives src*a + dst*(1-a): the
+ * ordinary over-composite.  A rectangle is unaffected, because its alpha is
+ * one across the whole bounding box -- but a SHAPE needs it, or every pixel
+ * of the bounding box is written and a circle comes out square.
+ */
+#define RA8P1_DRW_CTL2_BSF           (1UL << 9)   /* source factor = alpha  */
+#define RA8P1_DRW_CTL2_BDF           (1UL << 10)  /* dest factor  = alpha   */
+#define RA8P1_DRW_CTL2_BDI           (1UL << 12)  /* ...inverted, so 1-a    */
+#define RA8P1_DRW_CTL2_OVER          (RA8P1_DRW_CTL2_BSF | \
+                                      RA8P1_DRW_CTL2_BDF | \
+                                      RA8P1_DRW_CTL2_BDI)
+
+/* STATUS: the render is done when neither unit is busy.  DLISTACTIVE must
+ * also be clear before a new register-mode setup (UM 63.7.1). */
+#define RA8P1_DRW_ST_BUSYENUM   (1UL << 0)
+#define RA8P1_DRW_ST_BUSYWRITE  (1UL << 1)
+
+/** @brief Module stop: MSTPCRC.MSTPC6 gates the DRW; MSTPC4 gates the GLCDC. */
+#define RA8P1_MSTPCRC_DRW       (1UL << 6)
+#define RA8P1_MSTPCRC_GLCDC     (1UL << 4)
+#define RA8P1_MSTPCRC_MIPI_CSI  (1UL << 17)  /* CSI receiver + VIN together */
+
+/*---------------------------------------------------------------------------*/
+/* MIPI D-PHY (UM 65), CSI-2 receiver (UM 67), video input VIN (UM 68)       */
+/*---------------------------------------------------------------------------*/
+
+/** @brief D-PHY, shared between DSI and CSI; CSI uses it as a receiver. */
+#define RA8P1_DPHY_BASE         0x40346C00UL
+#define RA8P1_DPHY_REFCR        (RA8P1_DPHY_BASE + 0x00UL)  /* ref frequency */
+#define RA8P1_DPHY_PLOCR        (RA8P1_DPHY_BASE + 0x08UL)  /* PLL stop      */
+#define RA8P1_DPHY_PWRCR        (RA8P1_DPHY_BASE + 0x10UL)  /* power enable  */
+#define RA8P1_DPHY_SFR          (RA8P1_DPHY_BASE + 0x1CUL)  /* status flags  */
+#define RA8P1_DPHY_OCR          (RA8P1_DPHY_BASE + 0x20UL)  /* operation en  */
+#define RA8P1_DPHY_TIM1         (RA8P1_DPHY_BASE + 0x24UL)  /* T_INIT        */
+#define RA8P1_DPHY_TIM2         (RA8P1_DPHY_BASE + 0x28UL)  /* clk prep/sett */
+#define RA8P1_DPHY_TIM3         (RA8P1_DPHY_BASE + 0x2CUL)  /* hs prep/sett  */
+#define RA8P1_DPHY_TIM4         (RA8P1_DPHY_BASE + 0x30UL)  /* clk zero..trl */
+#define RA8P1_DPHY_TIM5         (RA8P1_DPHY_BASE + 0x34UL)  /* hs zero..exit */
+#define RA8P1_DPHY_TIM6         (RA8P1_DPHY_BASE + 0x38UL)  /* T_LPX         */
+#define RA8P1_DPHY_MDC          (RA8P1_DPHY_BASE + 0x48UL)  /* master enable */
+
+#define RA8P1_DPHY_PWRCR_PWRSEN (1UL << 0)
+#define RA8P1_DPHY_SFR_PWRSF    (1UL << 0)
+#define RA8P1_DPHY_OCR_DPHYEN   (1UL << 0)
+
+/** @brief CSI-2 receiver; interrupt enables stay 0, this port polls. */
+#define RA8P1_CSI_BASE          0x40347000UL
+#define RA8P1_CSI_MCT0          (RA8P1_CSI_BASE + 0x010UL)
+#define RA8P1_CSI_MCT2          (RA8P1_CSI_BASE + 0x018UL)
+#define RA8P1_CSI_MCT3          (RA8P1_CSI_BASE + 0x01CUL)
+#define RA8P1_CSI_RTCT          (RA8P1_CSI_BASE + 0x028UL)
+#define RA8P1_CSI_RTST          (RA8P1_CSI_BASE + 0x02CUL)
+#define RA8P1_CSI_EPCT          (RA8P1_CSI_BASE + 0x040UL)
+#define RA8P1_CSI_EMCT          (RA8P1_CSI_BASE + 0x044UL)
+#define RA8P1_CSI_DTEL          (RA8P1_CSI_BASE + 0x060UL)
+#define RA8P1_CSI_DTEH          (RA8P1_CSI_BASE + 0x064UL)
+#define RA8P1_CSI_RXST          (RA8P1_CSI_BASE + 0x070UL)
+#define RA8P1_CSI_RXSC          (RA8P1_CSI_BASE + 0x074UL)
+#define RA8P1_CSI_DLST0         (RA8P1_CSI_BASE + 0x080UL)
+#define RA8P1_CSI_DLST1         (RA8P1_CSI_BASE + 0x090UL)
+#define RA8P1_CSI_VCST0         (RA8P1_CSI_BASE + 0x100UL)
+#define RA8P1_CSI_PMST          (RA8P1_CSI_BASE + 0x200UL)
+#define RA8P1_CSI_GSCT          (RA8P1_CSI_BASE + 0x280UL)
+
+#define RA8P1_CSI_MCT3_RXEN     (1UL << 0)
+#define RA8P1_CSI_RTST_VSRSTS   (1UL << 0)
+/* MCT0: two lanes, no zero-length output, error-frame notify, reserved-
+ * packet pass, generic CSI-2 rule (the manual: "set to 1 for this LSI"),
+ * 24-bit ECC check. */
+#define RA8P1_CSI_MCT0_2LANE    (2UL | (1UL << 16) | (1UL << 17) | \
+                                 (1UL << 19) | (1UL << 20) | (1UL << 24))
+
+/** @brief Video input unit: preclip, colour conversion, memory writer. */
+#define RA8P1_VIN_BASE          0x40347400UL
+#define RA8P1_VIN_MC            (RA8P1_VIN_BASE + 0x000UL)
+#define RA8P1_VIN_MS            (RA8P1_VIN_BASE + 0x004UL)
+#define RA8P1_VIN_FC            (RA8P1_VIN_BASE + 0x008UL)
+#define RA8P1_VIN_SLPRC         (RA8P1_VIN_BASE + 0x00CUL)
+#define RA8P1_VIN_ELPRC         (RA8P1_VIN_BASE + 0x010UL)
+#define RA8P1_VIN_SPPRC         (RA8P1_VIN_BASE + 0x014UL)
+#define RA8P1_VIN_EPPRC         (RA8P1_VIN_BASE + 0x018UL)
+#define RA8P1_VIN_CSI_IFMD      (RA8P1_VIN_BASE + 0x020UL)
+#define RA8P1_VIN_CSIFLD        (RA8P1_VIN_BASE + 0x024UL)
+#define RA8P1_VIN_IS            (RA8P1_VIN_BASE + 0x02CUL)
+#define RA8P1_VIN_MB1           (RA8P1_VIN_BASE + 0x030UL)
+#define RA8P1_VIN_MB2           (RA8P1_VIN_BASE + 0x034UL)
+#define RA8P1_VIN_MB3           (RA8P1_VIN_BASE + 0x038UL)
+#define RA8P1_VIN_LC            (RA8P1_VIN_BASE + 0x03CUL)
+#define RA8P1_VIN_IE            (RA8P1_VIN_BASE + 0x040UL)
+#define RA8P1_VIN_INTS          (RA8P1_VIN_BASE + 0x044UL)
+#define RA8P1_VIN_DMR           (RA8P1_VIN_BASE + 0x058UL)
+#define RA8P1_VIN_UVAOF         (RA8P1_VIN_BASE + 0x060UL)
+#define RA8P1_VIN_UDS_CTRL      (RA8P1_VIN_BASE + 0x080UL)
+
+#define RA8P1_VIN_MC_ME         (1UL << 0)
+#define RA8P1_VIN_MC_ST         (1UL << 22)
+#define RA8P1_VIN_FC_CC         (1UL << 1)
+#define RA8P1_VIN_INTS_FIS      (1UL << 4)   /* frame write complete */
+/* MC value for this pipeline: odd/even interlace handling, YCbCr422 8-bit
+ * in, dithering direction on; conversion stays enabled (BPS clear). */
+#define RA8P1_VIN_MC_CFG        ((1UL << 3) | (1UL << 16) | (1UL << 24))
+/* CSI_IFMD: virtual channel 0, data type YUV422 8-bit, zero-extension. */
+#define RA8P1_VIN_IFMD_CFG      ((0x1EUL << 8) | (1UL << 25))
+/* DMR: no further conversion after the colour-space core, alpha bit one,
+ * output byte swap on, spare alpha byte as the vendor ships it. */
+#define RA8P1_VIN_DMR_CFG       (0xAA000014UL)
+
+/*---------------------------------------------------------------------------*/
+/* Cortex-M85 core peripherals (Armv8.1-M, not part-specific)                */
+/*---------------------------------------------------------------------------*/
+#define RA8P1_SCB_VTOR          0xE000ED08UL
+#define RA8P1_SCB_CPUID         0xE000ED00UL
+#define RA8P1_SYST_CSR          0xE000E010UL
+#define RA8P1_SYST_RVR          0xE000E014UL
+#define RA8P1_SYST_CVR          0xE000E018UL
+#define RA8P1_SYST_CSR_ENABLE   (1UL << 0)
+#define RA8P1_SYST_CSR_TICKINT  (1UL << 1)
+#define RA8P1_SYST_CSR_CLKSOURCE (1UL << 2)   /* processor clock, not ref  */
+#define RA8P1_SYST_CSR_COUNTFLAG (1UL << 16)
+/* SAU: readable only from the secure state, which makes it the cheapest
+ * direct evidence of which world the image is executing in (UM has nothing to
+ * say here -- this is Armv8-M architecture, B8.3). */
+#define RA8P1_SAU_CTRL          0xE000EDD0UL
+#define RA8P1_SAU_TYPE          0xE000EDD4UL
+#define RA8P1_NVIC_ISER(i)      (0xE000E100UL + (4UL * (i)))
+#define RA8P1_NVIC_ICER(i)      (0xE000E180UL + (4UL * (i)))
+#define RA8P1_NVIC_ICPR(i)      (0xE000E280UL + (4UL * (i)))
+/*
+ * PMSAv8 MPU (Armv8.1-M ARM B11).  Region attributes here are also what set
+ * CACHEABILITY through MAIR, so the caches must not be enabled before the
+ * regions exist: without programmed regions the M85 inherits the default
+ * memory map's attributes.
+ */
+#define RA8P1_MPU_BASE          0xE000ED90UL
+#define RA8P1_MPU_TYPE          (RA8P1_MPU_BASE + 0x00UL)  /* DREGION count */
+#define RA8P1_MPU_CTRL          (RA8P1_MPU_BASE + 0x04UL)
+#define RA8P1_MPU_RNR           (RA8P1_MPU_BASE + 0x08UL)
+#define RA8P1_MPU_RBAR          (RA8P1_MPU_BASE + 0x0CUL)
+#define RA8P1_MPU_RLAR          (RA8P1_MPU_BASE + 0x10UL)
+#define RA8P1_MPU_MAIR0         (RA8P1_MPU_BASE + 0x30UL)
+#define RA8P1_MPU_MAIR1         (RA8P1_MPU_BASE + 0x34UL)
+#define RA8P1_MPU_TYPE_DREGION_SHIFT  8U
+#define RA8P1_MPU_TYPE_DREGION_MASK   0xFFU
+
+#define RA8P1_MPU_CTRL_ENABLE       (1UL << 0)
+#define RA8P1_MPU_CTRL_HFNMIENA     (1UL << 1)
+#define RA8P1_MPU_CTRL_PRIVDEFENA   (1UL << 2)
+
+/* RBAR: base[31:5] | SH[4:3] | AP[2:1] | XN[0]  (ARM B11.2.9) */
+#define RA8P1_MPU_RBAR_AP_RW        (0x1UL << 1)   /* RW at any privilege */
+#define RA8P1_MPU_RBAR_AP_RO        (0x3UL << 1)   /* RO at any privilege */
+#define RA8P1_MPU_RBAR_AP_MASK      (0x3UL << 1)
+#define RA8P1_MPU_RBAR_XN           (1UL << 0)
+/* RLAR: limit[31:5] | AttrIndx[3:1] | EN[0]  (ARM B11.2.10) */
+#define RA8P1_MPU_RLAR_ATTR(i)      (((uint32_t)(i) & 0x7UL) << 1)
+#define RA8P1_MPU_RLAR_EN           (1UL << 0)
+
+/*
+ * MAIR attribute bytes.  Index 0 is Normal write-back read/write-allocate --
+ * the one that makes the D-cache actually cache SRAM; index 1 is Device
+ * nGnRE for peripherals, which must never be cached or speculated into.
+ */
+#define RA8P1_MPU_MAIR_NORMAL_WB    0xFFU
+#define RA8P1_MPU_MAIR_DEVICE       0x04U
+/* Normal, non-cacheable inner and outer (0b0100_0100).  The durable MRAM
+ * carve uses this: a D-cache line is 32 bytes, exactly the MRAM program
+ * granule, so a cached store would sit in the line instead of reaching the
+ * program buffer and an eviction would rewrite the whole granule at a time
+ * the code never asked for. */
+#define RA8P1_MPU_MAIR_NORMAL_NC    0x44U
+#define RA8P1_MPU_ATTR_NORMAL       0U
+#define RA8P1_MPU_ATTR_DEVICE       1U
+#define RA8P1_MPU_ATTR_NORMAL_NC    2U
+
+/* Cortex-M85 cache control (SCB CCR / cache maintenance, ARM B) */
+#define RA8P1_SCB_CCR           0xE000ED14UL
+#define RA8P1_SCB_CCR_IC        (1UL << 17)
+#define RA8P1_SCB_CCR_DC        (1UL << 16)
+#define RA8P1_SCB_CLIDR         0xE000ED78UL
+#define RA8P1_SCB_CTR           0xE000ED04UL
+#define RA8P1_SCB_CCSIDR        0xE000ED80UL
+#define RA8P1_SCB_CSSELR        0xE000ED84UL
+#define RA8P1_SCB_ICIALLU       0xE000EF50UL
+#define RA8P1_SCB_DCIMVAC       0xE000EF5CUL
+#define RA8P1_SCB_DCISW         0xE000EF60UL
+#define RA8P1_SCB_DCCMVAC       0xE000EF68UL
+#define RA8P1_SCB_DCCSW         0xE000EF6CUL
+#define RA8P1_SCB_DCCIMVAC      0xE000EF70UL
+#define RA8P1_SCB_DCCISW        0xE000EF74UL
+
+/** @brief Cortex-M85 cache line, in bytes; range ops round to it. */
+#define RA8P1_CACHE_LINE        32UL
+
+/* MemManage: SHCSR enables the fault, CFSR's low byte reports it. */
+#define RA8P1_SCB_SHCSR         0xE000ED24UL
+#define RA8P1_SCB_SHCSR_MEMFAULTENA (1UL << 16)
+#define RA8P1_SCB_CFSR          0xE000ED28UL
+#define RA8P1_SCB_MMFAR         0xE000ED34UL
+#define RA8P1_CFSR_MMARVALID    (1UL << 7)
+#define RA8P1_CFSR_DACCVIOL     (1UL << 1)
+#define RA8P1_CFSR_IACCVIOL     (1UL << 0)
+
+#define RA8P1_SCB_HFSR          0xE000ED2CUL
+#define RA8P1_SCB_BFAR          0xE000ED38UL
+#define RA8P1_CFSR_BFARVALID    (1UL << 15)
+/* Any of the four stacking/unstacking errors means the exception frame push
+ * itself faulted, so the words it points at are not the faulting context. */
+#define RA8P1_CFSR_STKERR_MSK   ((1UL << 4) | (1UL << 3) | \
+                                 (1UL << 12) | (1UL << 11))
+#define RA8P1_SCB_SHCSR_BUSFAULTENA  (1UL << 17)
+#define RA8P1_SCB_SHCSR_USGFAULTENA  (1UL << 18)
+
+#define RA8P1_SCB_AIRCR         0xE000ED0CUL
+#define RA8P1_AIRCR_VECTKEY     0x05FA0000UL
+#define RA8P1_AIRCR_SYSRESETREQ (1UL << 2)
+
+/*---------------------------------------------------------------------------*/
+/* Ethos-U55 NPU (UM ch.19, and the Arm TRM the chapter defers to)           */
+/*---------------------------------------------------------------------------*/
+
+/*
+ * UM Table 19.1 gives the specification and then points at the Arm TRM for the
+ * registers, so the offsets below are the TRM's, read back off the part rather
+ * than transcribed: ID and CONFIG are the two this port has confirmed.
+ *
+ * The domain is power-gated AND module-stopped out of reset, so every register
+ * here reads 0 until both are released, in the order UM 11.5.1 states.  That
+ * ordering is the whole of the bring-up: the module-stop bit must not move
+ * before the domain is powered (UM 11.2.6, MSTPA16 note 3).
+ */
+
+/** @brief NPUCBI, the NPU's 4 KB register window (UM Table, peripheral map). */
+#define RA8P1_NPU_BASE          0x40140000UL
+
+#define RA8P1_NPU_ID            (RA8P1_NPU_BASE + 0x000UL)
+#define RA8P1_NPU_STATUS        (RA8P1_NPU_BASE + 0x004UL)
+#define RA8P1_NPU_CMD           (RA8P1_NPU_BASE + 0x008UL)
+#define RA8P1_NPU_RESET         (RA8P1_NPU_BASE + 0x00CUL)
+#define RA8P1_NPU_QBASE         (RA8P1_NPU_BASE + 0x010UL)
+#define RA8P1_NPU_QREAD         (RA8P1_NPU_BASE + 0x018UL)
+#define RA8P1_NPU_QCONFIG       (RA8P1_NPU_BASE + 0x01CUL)
+#define RA8P1_NPU_QSIZE         (RA8P1_NPU_BASE + 0x020UL)
+#define RA8P1_NPU_PROT          (RA8P1_NPU_BASE + 0x024UL)
+#define RA8P1_NPU_CONFIG        (RA8P1_NPU_BASE + 0x028UL)
+
+/** @brief What a released NPU answers on this die; 0 means still gated. */
+#define RA8P1_NPU_ID_EXPECT     0x10104201UL
+
+/*
+ * CONFIG.macs_per_cc is a log2, so 8 means 256 MACs per cycle -- which is the
+ * count UM Table 19.1 states independently, and the pair agreeing is what
+ * confirms the window is the NPU rather than an aliased read.  The same 256
+ * picks Vela's accelerator configuration, so a wrong value here would compile
+ * a command stream the hardware cannot execute.
+ */
+#define RA8P1_NPU_CONFIG_MACS_SHIFT  0U
+#define RA8P1_NPU_CONFIG_MACS_MASK   0xFUL
+#define RA8P1_NPU_CONFIG_SHRAM_SHIFT 8U
+#define RA8P1_NPU_CONFIG_SHRAM_MASK  0xFFUL
+
+/** @brief Power gating for the NPU domain (UM 11.2.15); PDDE is inverted --
+ *         0 powers the domain ON.  Resets to 0x81: gated and held off. */
+/*
+ * Graphics power domain (UM 11.2.14).  DRW, GLCDC, MIPI DSI and MIPI CSI all
+ * sit inside it and it is powered OFF at reset -- PDCTRGD reads 0x81, PDDE
+ * set and PDPGSF confirming the gate.  Releasing the module stop alone is not
+ * enough: with the domain down every register in the block reads back as zero
+ * with no fault, so the failure looks like an absent peripheral rather than a
+ * missing step.  Same shape and same bit layout as PDCTRNPU below.
+ */
+#define RA8P1_PDCTRGD           (RA8P1_SYSC_BASE + 0x110UL)   /* 8-bit */
+#define RA8P1_PDCTRGD_PDDE      (1U << 0)   /* 1 = power OFF the domain    */
+#define RA8P1_PDCTRGD_PDCSF     (1U << 6)   /* gating control in progress  */
+#define RA8P1_PDCTRGD_PDPGSF    (1U << 7)   /* 1 = domain is gated off     */
+
+#define RA8P1_PDCTRNPU          (RA8P1_SYSC_BASE + 0x114UL)   /* 8-bit */
+#define RA8P1_PDCTRNPU_PDDE     (1U << 0)   /* 1 = power OFF the domain    */
+#define RA8P1_PDCTRNPU_PDCSF    (1U << 6)   /* gating control in progress  */
+#define RA8P1_PDCTRNPU_PDPGSF   (1U << 7)   /* 1 = domain is gated off     */
+
+/** @brief MSTPCRA gates the NPU module itself (UM 11.2.6, MSTPA16).  Bits
+ *         21:17 read as 1 and must be written back as 1. */
+#define RA8P1_MSTPCRA           (RA8P1_MSTP_BASE + 0x00UL)
+#define RA8P1_MSTPA_NPU         (1UL << 16)
+
+/*
+ * AXI limits and region configuration.  The block powers up with these at
+ * zero, which encodes ONE outstanding read and ONE outstanding write, and a
+ * stream submitted against that faults its first data access rather than
+ * running slowly.  The Arm core driver's defaults are 32 outstanding reads
+ * and 16 writes, each stored minus one.
+ */
+#define RA8P1_NPU_AXI_LIMIT     0x0F1F0000UL
+/* Every region and the command queue on limit set 0.  The core driver's
+ * defaults spread them across sets 1-3, which reach the NPU's second AXI
+ * master -- the port wired to external flash here, and the wrong one for a
+ * model Vela laid out entirely in SRAM. */
+#define RA8P1_NPU_REGIONCFG_DEFAULT 0x00000000UL
+#define RA8P1_NPU_QCONFIG_DEFAULT   0UL
+#define RA8P1_NPU_AXI_LIMIT0    (RA8P1_NPU_BASE + 0x040UL)
+#define RA8P1_NPU_AXI_LIMIT1    (RA8P1_NPU_BASE + 0x044UL)
+#define RA8P1_NPU_AXI_LIMIT2    (RA8P1_NPU_BASE + 0x048UL)
+#define RA8P1_NPU_AXI_LIMIT3    (RA8P1_NPU_BASE + 0x04CUL)
+
+/** @brief ICU event for NPU_IRQ, to be routed to an NVIC line (UM ch.13). */
+#define RA8P1_ICU_EVENT_NPU_IRQ 0x067U
+
+/** @brief MOCO control (UM 9.2.18).  Power gating requires the MOCO to be
+ *         running, which is why the NPU bring-up reads it first. */
+#define RA8P1_MOCOCR            (RA8P1_SYSC_BASE + 0x038UL)   /* 8-bit */
+#define RA8P1_MOCOCR_MCSTP      (1U << 0)   /* 1 = MOCO stopped */
+
+/*
+ * Ethos-U55 CMD and STATUS, as far as this port relies on them.  The command
+ * stream itself is N2's business; N1 needs only the interrupt acknowledge.
+ */
+#define RA8P1_NPU_RESET_CPL     (1UL << 0)   /* 1 = privileged        */
+#define RA8P1_NPU_RESET_CSL     (1UL << 1)   /* 1 = non-secure        */
+#define RA8P1_NPU_STATUS_RESET  (1UL << 3)   /* reset in progress     */
+
+#define RA8P1_NPU_CMD_RUN       (1UL << 0)
+#define RA8P1_NPU_CMD_CLEAR_IRQ (1UL << 1)
+#define RA8P1_NPU_CMD_CLK_Q_EN  (1UL << 2)
+#define RA8P1_NPU_CMD_PWR_Q_EN  (1UL << 3)
+#define RA8P1_NPU_CMD_STOP_REQ  (1UL << 4)
+
+#define RA8P1_NPU_STATUS_STATE  (1UL << 0)   /* 1 = running          */
+#define RA8P1_NPU_STATUS_IRQ    (1UL << 1)
+#define RA8P1_NPU_STATUS_BUSERR (1UL << 2)
+#define RA8P1_NPU_STATUS_PARSE  (1UL << 4)   /* command parse error  */
+#define RA8P1_NPU_STATUS_END    (1UL << 5)   /* command end reached  */
+
+/* Queue and region base pointers; each base is a 64-bit pair. */
+#define RA8P1_NPU_QBASE_HI      (RA8P1_NPU_BASE + 0x014UL)
+#define RA8P1_NPU_QREGIONCFG    (RA8P1_NPU_BASE + 0x03CUL)
+#define RA8P1_NPU_BASEP(n)      (RA8P1_NPU_BASE + 0x080UL + (8UL * (n)))
+
+#endif /* TIKU_RA8P1_REGS_H_ */

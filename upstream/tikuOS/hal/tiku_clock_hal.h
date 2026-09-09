@@ -1,0 +1,115 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_clock_hal.h - Hardware abstraction layer interface for system clock
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
+ * @file tiku_clock_hal.h
+ * @brief Platform-agnostic clock architecture interface
+ *
+ * Declares the functions that each platform must implement to provide
+ * system clock functionality. No platform-specific headers are included.
+ */
+
+#ifndef TIKU_CLOCK_HAL_H_
+#define TIKU_CLOCK_HAL_H_
+
+/*---------------------------------------------------------------------------*/
+/* TYPE DEFINITIONS                                                          */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @typedef tiku_clock_arch_time_t
+ * @brief Architecture-specific clock time type
+ *
+ * Platforms provide this via their arch header (e.g. tiku_timer_arch.h).
+ * This fallback applies only if no arch header has defined it.
+ */
+#ifndef TIKU_CLOCK_ARCH_TIME_T_DEFINED
+typedef unsigned long tiku_clock_arch_time_t;
+#define TIKU_CLOCK_ARCH_TIME_T_DEFINED
+#endif
+
+/*---------------------------------------------------------------------------*/
+/* REQUIRED PLATFORM FUNCTIONS                                               */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Initialize platform-specific clock hardware
+ */
+void tiku_clock_arch_init(void);
+
+/**
+ * @brief Get current clock time in ticks
+ * @return Current tick count
+ */
+tiku_clock_arch_time_t tiku_clock_arch_time(void);
+
+/**
+ * @brief Get current time in seconds
+ * @return Seconds since system start
+ */
+unsigned long tiku_clock_arch_seconds(void);
+
+/**
+ * @brief Set the seconds counter
+ * @param sec Seconds value to set
+ */
+void tiku_clock_arch_set_seconds(unsigned long sec);
+
+/**
+ * @brief Busy-wait for specified clock ticks
+ * @param t Number of ticks to wait
+ */
+void tiku_clock_arch_wait(tiku_clock_arch_time_t t);
+
+/**
+ * @brief CPU delay loop
+ * @param i Delay units (platform-specific calibration)
+ */
+void tiku_clock_arch_delay(unsigned int i);
+
+/**
+ * @brief Get fine-grained clock value
+ * @return Timer counter value within current tick
+ */
+unsigned short tiku_clock_arch_fine(void);
+
+/**
+ * @brief Get maximum fine clock value
+ * @return Maximum fine clock count
+ */
+int tiku_clock_arch_fine_max(void);
+
+/*---------------------------------------------------------------------------*/
+/* CLOCK SOURCE FAULT REPORTING                                              */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Clock source fault codes.
+ *
+ * Reported when the platform could not bring up the intended low-frequency
+ * source and fell back to a less accurate one.  The tick keeps running but no
+ * longer matches TIKU_CLOCK_SECOND, so every software timer drifts with it.
+ */
+enum tiku_clock_arch_fault_code {
+  TIKU_CLOCK_ARCH_FAULT_NONE     = 0, /**< Configured source is in use */
+  TIKU_CLOCK_ARCH_FAULT_LFXT_VLO = 1, /**< XT1 failed; fell back to VLO */
+};
+
+/**
+ * @brief Return the current clock-source fault code.
+ *
+ * Set by tiku_clock_arch_init() if the requested source could not be
+ * brought up. Stays sticky until the next init.
+ */
+unsigned char tiku_clock_arch_fault(void);
+
+#endif /* TIKU_CLOCK_HAL_H_ */

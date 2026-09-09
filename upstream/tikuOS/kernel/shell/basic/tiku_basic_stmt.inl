@@ -1,0 +1,2653 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_basic_stmt.inl - one exec_<keyword> per BASIC statement.
+ *
+ * Covers control flow, loops, DIM and DEF FN, DATA and READ, the hardware bridges,
+ * reactive registrations and error handling.  The keyword switch and the
+ * colon-separated runner live in dispatch, since they reference symbols from here.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* Forward declarations for the dispatcher (defined in
+ * tiku_basic_dispatch.inl). */
+static void exec_stmt(const char **p);
+static void exec_stmts(const char **p);
+
+/**
+ * @brief PRINT statement.
+ *
+ * Each item is a numeric or string expression, separated by `,` (one space
+ * between them) or `;` (no separator); a trailing `;` suppresses the newline.
+ * `TAB(n)` and `SPC(n)` tap the print stream and are recognised here.
+ *
+ * @note TAB(n) advances to 1-based column n and does nothing if already past
+ *       it; SPC(n) emits n spaces unconditionally.  The print column is local
+ *       to this statement -- no global cursor -- which matches the common
+ *       BASIC convention.
+ */
+static void
+exec_print(const char **p)
+{
+    int  col = 0;
+    int  trailing = 0;
+    skip_ws(p);
+    while (cur_peek(p) != '\0' && cur_peek(p) != ':') {
+        /* TAB(n) and SPC(n) -- print-stream-tap pseudo-fns. */
+        if (match_kw(p, "TAB")) {
+            long target;
+            skip_ws(p);
+            if (cur_peek(p) != '(') {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "'(' expected");
+                return;
+            }
+            cur_advance(p);
+            target = parse_expr(p);
+            if (basic_error) return;
+            skip_ws(p);
+            if (cur_peek(p) != ')') {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected");
+                return;
+            }
+            cur_advance(p);
+            while (col < target - 1) {
+                SHELL_PRINTF(" ");
+                col++;
+            }
+            trailing = 0;
+            goto sep;
+        }
+        if (match_kw(p, "SPC")) {
+            long n;
+            skip_ws(p);
+            if (cur_peek(p) != '(') {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "'(' expected");
+                return;
+            }
+            cur_advance(p);
+            n = parse_expr(p);
+            if (basic_error) return;
+            skip_ws(p);
+            if (cur_peek(p) != ')') {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected");
+                return;
+            }
+            cur_advance(p);
+            while (n-- > 0) {
+                SHELL_PRINTF(" ");
+                col++;
+            }
+            trailing = 0;
+            goto sep;
+        }
+#if TIKU_BASIC_STRVARS_ENABLE
+        if (peek_string_expr(*p)) {
+            char buf[TIKU_BASIC_STR_BUF_CAP];
+            int  i;
+            if (parse_strexpr(p, buf, sizeof(buf)) != 0) return;
+            SHELL_PRINTF("%s", buf);
+            for (i = 0; buf[i] != '\0'; i++) col++;
+        } else
+#endif
+        {
+            long v = parse_expr(p);
+            char nbuf[16];
+            int  n;
+            if (basic_error) return;
+            n = snprintf(nbuf, sizeof(nbuf), "%ld", v);
+            SHELL_PRINTF("%s", nbuf);
+            if (n > 0) col += n;
+        }
+        trailing = 0;
+sep:
+        skip_ws(p);
+        if (cur_peek(p) == ',') { SHELL_PRINTF(" "); col++; cur_advance(p); trailing = 1; skip_ws(p); continue; }
+        if (cur_peek(p) == ';') { cur_advance(p);                       trailing = 1; skip_ws(p); continue; }
+        break;
+    }
+    if (!trailing) {
+        SHELL_PRINTF("\n");
+    }
+}
+
+static void
+exec_let(const char **p, int already_consumed_var)
+{
+    int   idx;
+    int   is_string = 0;
+    long  v;
+    (void)already_consumed_var;
+    skip_ws(p);
+    if (!parse_var_full(p, &idx, &is_string)) {
+        if (!basic_error) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+        }
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != '=') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'=' expected");
+        return;
+    }
+    cur_advance(p);
+#if TIKU_BASIC_STRVARS_ENABLE
+    if (is_string) {
+        char buf[TIKU_BASIC_STR_BUF_CAP];
+        if (parse_strexpr(p, buf, sizeof(buf)) != 0) return;
+        basic_strvars[idx] = basic_str_alloc(buf, strlen(buf));
+        if (basic_strvars[idx] == NULL) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "out of string heap");
+        }
+        return;
+    }
+#endif
+    (void)is_string;
+    v = parse_expr(p);
+    if (basic_error) return;
+    /* A CONST-defined named slot (index >= 26) is read-only. */
+    if (idx >= 26 && basic_namedvar_const[idx - 26]) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "cannot assign to CONST");
+        return;
+    }
+    basic_vars[idx] = v;
+}
+
+/* CONST NAME = expr (F4): evaluate expr once and bind NAME as a read-only
+ * numeric named constant.  Reassigning it afterwards is rejected in exec_let.
+ * (String constants are not supported -- use a plain string var.) */
+static void
+exec_const(const char **p)
+{
+    int  idx, is_string = 0;
+    long v;
+    skip_ws(p);
+    if (!parse_var_full(p, &idx, &is_string) || is_string) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "CONST needs a numeric NAME");
+        return;
+    }
+    if (idx < 26) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "CONST needs a multi-letter name");
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != '=') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'=' expected");
+        return;
+    }
+    cur_advance(p);
+    v = parse_expr(p);
+    if (basic_error) return;
+    basic_namedvar_const[idx - 26] = 0;      /* allow this defining write */
+    basic_vars[idx]                = v;
+    basic_namedvar_const[idx - 26] = 1;      /* now read-only */
+}
+
+#if TIKU_BASIC_STRVARS_ENABLE
+/**
+ * @brief LHS string-slice assignment.
+ *
+ * MID$(A$, start [, n]) overwrites n chars at 1-based `start` (LEN(expr$) when
+ * n is omitted); LEFT$(A$, n) and RIGHT$(A$, n) overwrite the first or last n.
+ * The length of A$ never changes.
+ *
+ * @note Excess source bytes are dropped and missing ones leave the original
+ *       characters, matching QuickBASIC.  An unbound A$ is treated as empty.
+ * @param p     Cursor; on entry points at the keyword, on success
+ *              advanced past the RHS expression.
+ * @param kind  Which slice form: 'L' = LEFT$, 'R' = RIGHT$,
+ *              'M' = MID$.
+ */
+static void
+exec_strslice_assign(const char **p, char kind)
+{
+    char      buf[TIKU_BASIC_STR_BUF_CAP];
+    char      rhs[TIKU_BASIC_STR_BUF_CAP];
+    const char *src;
+    size_t    src_len;
+    long      start;          /* 1-based */
+    long      take;
+    int       sidx;
+    char      svar;
+    size_t    rlen;
+    size_t    i;
+
+    skip_ws(p);
+    if (cur_peek(p) != '(') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'(' expected");
+        return;
+    }
+    cur_advance(p);
+    skip_ws(p);
+    /* Target var: A$..Z$ */
+    svar = to_upper(cur_peek(p));
+    if (svar < 'A' || svar > 'Z' ||
+        cur_peek_at(p, 1) != '$' || is_word_cont(cur_peek_at(p, 2))) {
+        basic_throw(TIKU_BASIC_ERR_TYPE, "string var expected");
+        return;
+    }
+    sidx = svar - 'A';
+    cur_skip(p, 2);
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return;
+    }
+    cur_advance(p);
+    take = -1;
+    if (kind == 'M') {
+        start = parse_expr(p);
+        if (basic_error) return;
+        skip_ws(p);
+        if (cur_peek(p) == ',') {
+            cur_advance(p);
+            take = parse_expr(p);
+            if (basic_error) return;
+        }
+    } else {
+        /* LEFT$ / RIGHT$: only one count argument. */
+        take = parse_expr(p);
+        if (basic_error) return;
+        if (take < 0) take = 0;
+        start = (kind == 'L') ? 1L : -1L;        /* see fixup below */
+    }
+    skip_ws(p);
+    if (cur_peek(p) != ')') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected");
+        return;
+    }
+    cur_advance(p);
+    skip_ws(p);
+    if (cur_peek(p) != '=') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'=' expected");
+        return;
+    }
+    cur_advance(p);
+    if (parse_strexpr(p, rhs, sizeof(rhs)) != 0) return;
+
+    src = basic_strvars[sidx] ? basic_strvars[sidx] : "";
+    src_len = strlen(src);
+    if (src_len + 1u > sizeof(buf)) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "string too long");
+        return;
+    }
+    memcpy(buf, src, src_len);
+    buf[src_len] = '\0';
+    rlen = strlen(rhs);
+
+    if (kind == 'R') {
+        /* RIGHT$(A$, n) = expr$ -- overwrite the trailing n chars. */
+        if ((size_t)take > src_len) take = (long)src_len;
+        start = (long)src_len - take + 1;        /* 1-based */
+        if (start < 1) start = 1;
+    }
+    if (start < 1 || (size_t)start > src_len) {
+        /* Out-of-range start is a no-op (matches QuickBASIC). */
+        basic_strvars[sidx] = basic_str_alloc(buf, src_len);
+        if (basic_strvars[sidx] == NULL) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "out of string heap");
+        }
+        return;
+    }
+    /* For LEFT$ and MID$ without an explicit n, take = -1 means
+     * "use the RHS length" (capped by what's left in the dest). */
+    if (take < 0) take = (long)rlen;
+    if ((size_t)(start - 1 + take) > src_len) {
+        take = (long)src_len - (start - 1);
+    }
+    if ((size_t)take > rlen) take = (long)rlen;
+    for (i = 0; i < (size_t)take; i++) {
+        buf[start - 1 + i] = rhs[i];
+    }
+    basic_strvars[sidx] = basic_str_alloc(buf, src_len);
+    if (basic_strvars[sidx] == NULL) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "out of string heap");
+    }
+}
+#endif /* TIKU_BASIC_STRVARS_ENABLE */
+
+static void
+exec_input(const char **p)
+{
+    int  idx;
+    char buf[TIKU_BASIC_LINE_MAX];
+    int  is_string = 0;
+    long v;
+    const char *q;
+
+    /* Optional prompt: INPUT "prompt"; var  -- the literal prefix is
+     * printed before the `? ` so users can write
+     *   INPUT "name"; A$
+     * without manually wrapping it in PRINT. */
+    skip_ws(p);
+    if (cur_peek(p) == '"') {
+        cur_advance(p);
+        while (cur_peek(p) && cur_peek(p) != '"') {
+            char e[2]; e[0] = cur_peek(p); e[1] = '\0';
+            SHELL_PRINTF("%s", e);
+            cur_advance(p);
+        }
+        if (cur_peek(p) == '"') cur_advance(p);
+        skip_ws(p);
+        if (cur_peek(p) == ';' || cur_peek(p) == ',') { cur_advance(p); skip_ws(p); }
+    }
+
+    if (!parse_var_full(p, &idx, &is_string)) {
+        if (!basic_error) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+        }
+        return;
+    }
+
+    SHELL_PRINTF("? ");
+    if (read_line(buf, sizeof(buf)) < 0) {
+        basic_error = 1;
+        return;
+    }
+#if TIKU_BASIC_STRVARS_ENABLE
+    if (is_string) {
+        basic_strvars[idx] = basic_str_alloc(buf, strlen(buf));
+        if (basic_strvars[idx] == NULL) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "out of string heap");
+        }
+        return;
+    }
+#endif
+    (void)is_string;
+    q = buf;
+    v = parse_expr(&q);
+    if (basic_error) return;
+    basic_vars[idx] = v;
+}
+
+/* Look up a `name:` label. Walks the program in storage order looking
+ * for a line whose first non-whitespace token is `name` followed by
+ * a colon. Returns the prog[] index, or -1 if not found.
+ *
+ * Labels are matched case-insensitively and must be at line start
+ * (immediately after any leading whitespace -- not after a number or
+ * other statement). */
+/* A3 #2: one walk over prog[] collecting label definitions (`name:` at line
+ * start) and SUB headers into the registries.  Rebuilt after any edit. */
+static void
+basic_symreg_build(void)
+{
+    uint16_t i;
+    basic_label_reg_n   = 0;
+    basic_label_reg_ovf = 0;
+#if TIKU_BASIC_SUBS_ENABLE
+    basic_sub_reg_n     = 0;
+    basic_sub_reg_ovf   = 0;
+#endif
+    for (i = 0; i < TIKU_BASIC_PROGRAM_LINES; i++) {
+        const char *t;
+        if (prog[i].number == 0) continue;
+        t = prog[i].text;
+        while (*t == ' ' || *t == '\t') t++;
+        if (is_alpha(*t)) {
+            const char *r = t;
+            while (is_word_cont(*r)) r++;
+            if (*r == ':') {
+                if (basic_label_reg_n < BASIC_SYMREG_MAX) {
+                    basic_label_reg[basic_label_reg_n].idx = i;
+                    basic_label_reg[basic_label_reg_n].off =
+                        (uint8_t)(t - prog[i].text);
+                    basic_label_reg_n++;
+                } else {
+                    basic_label_reg_ovf = 1;
+                }
+                continue;               /* a label line is not a SUB header */
+            }
+        }
+#if TIKU_BASIC_SUBS_ENABLE
+        {
+            size_t k = tok_kw_at(t, "SUB");
+            if (k != 0) {
+                const char *nm = t + k;
+                while (*nm == ' ' || *nm == '\t') nm++;
+                if (basic_sub_reg_n < BASIC_SYMREG_MAX) {
+                    basic_sub_reg[basic_sub_reg_n].idx = i;
+                    basic_sub_reg[basic_sub_reg_n].off =
+                        (uint8_t)(nm - prog[i].text);
+                    basic_sub_reg_n++;
+                } else {
+                    basic_sub_reg_ovf = 1;
+                }
+            }
+        }
+#endif
+    }
+    basic_symreg_ok = 1;
+}
+
+static int
+prog_find_label(const char *name, size_t name_len)
+{
+    uint16_t i;
+    size_t  k;
+    uint8_t r;
+    if (!basic_symreg_ok) basic_symreg_build();
+    for (r = 0; r < basic_label_reg_n; r++) {
+        const char *t = prog[basic_label_reg[r].idx].text +
+                        basic_label_reg[r].off;
+        for (k = 0; k < name_len; k++) {
+            if (to_upper(t[k]) != to_upper(name[k])) break;
+        }
+        if (k == name_len && t[name_len] == ':') {
+            return (int)basic_label_reg[r].idx;
+        }
+    }
+    if (!basic_label_reg_ovf) return -1;
+    /* Registry overflowed: fall back to the full scan. */
+    for (i = 0; i < TIKU_BASIC_PROGRAM_LINES; i++) {
+        const char *t;
+        if (prog[i].number == 0) continue;
+        t = prog[i].text;
+        while (*t == ' ' || *t == '\t') t++;
+        for (k = 0; k < name_len; k++) {
+            if (to_upper(t[k]) != to_upper(name[k])) break;
+        }
+        if (k == name_len && t[name_len] == ':') return (int)i;
+    }
+    return -1;
+}
+
+/* Try to consume a label-style identifier. If the cursor sits on an
+ * alpha char that is followed by another word-cont char (so it cannot
+ * be a single-letter variable parsed as a numeric expression), copy
+ * the identifier into @p out and advance @p p past it; resolve to a
+ * line number via the label table.  Returns:
+ *   1  -> matched and resolved -> *out_target = line number
+ *   0  -> not a label (caller should fall back to parse_expr)
+ *  -1  -> matched but unknown -> basic_error set */
+static int
+parse_label_ref(const char **p, long *out_target)
+{
+    const char *q;
+    char        name[16];
+    size_t      n;
+    int         idx;
+
+    skip_ws(p);
+    q = cur_mark(p);
+    if (!is_alpha(*q)) return 0;
+    /* If the next character ends the identifier (i.e. the alpha is a
+     * single-letter variable), don't treat as a label. */
+    if (!is_word_cont(q[1])) return 0;
+    n = 0;
+    while (is_word_cont(*q) && n + 1 < sizeof(name)) {
+        name[n++] = *q;
+        q++;
+    }
+    name[n] = '\0';
+    idx = prog_find_label(name, n);
+    if (idx < 0) {
+        basic_throwf(TIKU_BASIC_ERR_GENERAL, "unknown label %s", name);
+        return -1;
+    }
+    cur_set(p, q);
+    *out_target = (long)prog[idx].number;
+    return 1;
+}
+
+static void
+exec_goto(const char **p)
+{
+    long target;
+    int  rc = parse_label_ref(p, &target);
+    if (rc < 0) return;
+    if (rc == 0) {
+        target = parse_expr(p);
+        if (basic_error) return;
+    }
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "GOTO outside RUN");
+        return;
+    }
+    basic_pc = (uint16_t)target;
+    basic_pc_set = 1;
+}
+
+/* Resolve the line number that should run AFTER `current_line`
+ * (for setting up the GOSUB return address). 0 means "fall off
+ * the program -> end RUN". */
+static uint16_t
+line_after(uint16_t current_line)
+{
+    int n = prog_next_index((uint16_t)(current_line + 1));
+    return (n < 0) ? 0u : prog[n].number;
+}
+
+static void
+exec_gosub(const char **p)
+{
+    long target;
+    int  rc = parse_label_ref(p, &target);
+    if (rc < 0) return;
+    if (rc == 0) {
+        target = parse_expr(p);
+        if (basic_error) return;
+    }
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "GOSUB outside RUN");
+        return;
+    }
+    if (gosub_sp >= TIKU_BASIC_GOSUB_DEPTH) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "GOSUB stack overflow");
+        return;
+    }
+    gosub_stack[gosub_sp++] = line_after(basic_pc);
+    basic_pc = (uint16_t)target;
+    basic_pc_set = 1;
+}
+
+static void
+exec_return(void)
+{
+    uint16_t r;
+    if (gosub_sp == 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "RETURN without GOSUB");
+        return;
+    }
+    r = gosub_stack[--gosub_sp];
+    if (r == 0u) {
+        basic_running = 0;
+        basic_pc = 0;
+        return;
+    }
+    basic_pc = r;
+    basic_pc_set = 1;
+}
+
+/* FOR var = e1 TO e2 [STEP e3]
+ *
+ * Pushes a frame whose `loop_line` is the line right after the FOR
+ * statement, sets var to e1, and falls through. NEXT pops or jumps
+ * back to `loop_line`. STEP defaults to 1.
+ *
+ * MVP restrictions:
+ *   - Run-mode only (FOR/NEXT can't be used in immediate mode).
+ *   - Re-entering an active FOR (e.g. `FOR I = 1 TO 5` while a frame
+ *     for I already exists) starts a fresh frame on top -- it does
+ *     not reuse or close the prior one. */
+
+/*---------------------------------------------------------------------------*/
+/* LOOP-MATCHING SCANNERS                                                    */
+/*---------------------------------------------------------------------------*/
+
+/* Forward decl: find_matching_wend lives further down with the
+ * WHILE / WEND machinery; EXIT WHILE (below) needs it here. */
+static int find_matching_wend(uint16_t start_line);
+
+/**
+ * @brief Scan forward for the NEXT that matches the FOR at
+ *        @p start_line, tracking nested FOR / NEXT depth.
+ *
+ * @return prog[] index of the matching NEXT, or -1 if not found.
+ */
+static int
+find_matching_next(uint16_t start_line)
+{
+    int depth = 1;
+    int idx = prog_next_index((uint16_t)(start_line + 1));
+    while (idx >= 0) {
+        const char *t = prog[idx].text;
+        skip_ws(&t);
+        if      (match_kw(&t, "FOR"))  { depth++; }
+        else if (match_kw(&t, "NEXT")) {
+            depth--;
+            if (depth == 0) return idx;
+        }
+        if (prog[idx].number == 0xFFFFu) break;
+        idx = prog_next_index((uint16_t)(prog[idx].number + 1));
+    }
+    return -1;
+}
+
+/**
+ * @brief Scan forward for the UNTIL that matches the REPEAT at
+ *        @p start_line, tracking nested REPEAT / UNTIL depth.
+ *
+ * @return prog[] index of the matching UNTIL, or -1 if not found.
+ */
+static int
+find_matching_until(uint16_t start_line)
+{
+    int depth = 1;
+    int idx = prog_next_index((uint16_t)(start_line + 1));
+    while (idx >= 0) {
+        const char *t = prog[idx].text;
+        skip_ws(&t);
+        if      (match_kw(&t, "REPEAT")) { depth++; }
+        else if (match_kw(&t, "UNTIL"))  {
+            depth--;
+            if (depth == 0) return idx;
+        }
+        if (prog[idx].number == 0xFFFFu) break;
+        idx = prog_next_index((uint16_t)(prog[idx].number + 1));
+    }
+    return -1;
+}
+
+/*---------------------------------------------------------------------------*/
+/* EXIT / CONTINUE                                                           */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Helper: jump basic_pc to the line AFTER @p idx in prog[].
+ *
+ * If @p idx is the last line, the run ends.
+ */
+static void
+basic_jump_after(int idx)
+{
+    int n = prog_next_index((uint16_t)(prog[idx].number + 1));
+    if (n < 0) {
+        basic_running = 0;
+        basic_pc      = 0;
+        return;
+    }
+    basic_pc     = prog[n].number;
+    basic_pc_set = 1;
+}
+
+#if TIKU_BASIC_SUBS_ENABLE
+static void exec_endsub(void);      /* defined later in tiku_basic_subs.inl */
+#endif
+
+/**
+ * @brief EXIT FOR | EXIT WHILE | EXIT REPEAT | EXIT SUB  -- early exit from
+ *        the innermost matching loop or subroutine.
+ *
+ * Pops the corresponding frame and advances basic_pc to the line after the
+ * matching NEXT / WEND / UNTIL, or to the caller for EXIT SUB.  An exit in
+ * immediate mode is rejected, there being no run to terminate.
+ */
+static void
+exec_exit(const char **p)
+{
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT outside RUN");
+        return;
+    }
+    skip_ws(p);
+#if TIKU_BASIC_SUBS_ENABLE
+    if (match_kw(p, "SUB")) {
+        if (basic_call_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT SUB outside a SUB");
+            return;
+        }
+        exec_endsub();          /* restore params+locals, return to caller */
+        return;
+    }
+#endif
+    if (match_kw(p, "FOR")) {
+        int idx;
+        if (for_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT FOR without FOR");
+            return;
+        }
+        idx = find_matching_next(basic_pc);
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "FOR without NEXT");
+            return;
+        }
+        for_sp--;
+        basic_jump_after(idx);
+        return;
+    }
+    if (match_kw(p, "WHILE")) {
+        int idx;
+        if (loop_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT WHILE without WHILE");
+            return;
+        }
+        idx = find_matching_wend(loop_stack[loop_sp - 1].back_line);
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "WHILE without WEND");
+            return;
+        }
+        loop_sp--;
+        basic_jump_after(idx);
+        return;
+    }
+    if (match_kw(p, "REPEAT")) {
+        int idx;
+        if (loop_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT REPEAT without REPEAT");
+            return;
+        }
+        idx = find_matching_until(loop_stack[loop_sp - 1].back_line);
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "REPEAT without UNTIL");
+            return;
+        }
+        loop_sp--;
+        basic_jump_after(idx);
+        return;
+    }
+    basic_throw(TIKU_BASIC_ERR_GENERAL, "EXIT FOR | WHILE | REPEAT | SUB");
+}
+
+/**
+ * @brief CONTINUE FOR | CONTINUE WHILE | CONTINUE REPEAT  -- jump to
+ *        the loop's continuation point so it can re-evaluate.
+ *
+ * For FOR, jumps to the NEXT line so the step/compare runs.
+ * For WHILE, jumps to the WHILE line so the condition re-checks.
+ * For REPEAT, jumps to the UNTIL line so the condition runs.
+ */
+static void
+exec_continue(const char **p)
+{
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "CONTINUE outside RUN");
+        return;
+    }
+    skip_ws(p);
+    if (match_kw(p, "FOR")) {
+        int idx;
+        if (for_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "CONTINUE FOR without FOR");
+            return;
+        }
+        idx = find_matching_next(
+            (uint16_t)(for_stack[for_sp - 1].loop_line - 1u));
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "FOR without NEXT");
+            return;
+        }
+        basic_pc     = prog[idx].number;
+        basic_pc_set = 1;
+        return;
+    }
+    if (match_kw(p, "WHILE")) {
+        if (loop_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "CONTINUE WHILE without WHILE");
+            return;
+        }
+        basic_pc     = loop_stack[loop_sp - 1].back_line;
+        basic_pc_set = 1;
+        return;
+    }
+    if (match_kw(p, "REPEAT")) {
+        int idx;
+        if (loop_sp == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "CONTINUE REPEAT without REPEAT");
+            return;
+        }
+        idx = find_matching_until(loop_stack[loop_sp - 1].back_line);
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "REPEAT without UNTIL");
+            return;
+        }
+        basic_pc     = prog[idx].number;
+        basic_pc_set = 1;
+        return;
+    }
+    basic_throw(TIKU_BASIC_ERR_GENERAL, "CONTINUE FOR | WHILE | REPEAT");
+}
+
+/*---------------------------------------------------------------------------*/
+/* FOR / NEXT                                                                */
+/*---------------------------------------------------------------------------*/
+
+static void
+exec_for(const char **p)
+{
+    int  idx;
+    long e1, e2, e3 = 1;
+
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "FOR outside RUN");
+        return;
+    }
+    if (for_sp >= TIKU_BASIC_FOR_DEPTH) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "FOR stack overflow");
+        return;
+    }
+    if (!parse_var(p, &idx)) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != '=') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'=' expected");
+        return;
+    }
+    cur_advance(p);
+    e1 = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if (!match_kw(p, "TO")) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "TO expected");
+        return;
+    }
+    e2 = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if (match_kw(p, "STEP")) {
+        e3 = parse_expr(p);
+        if (basic_error) return;
+        if (e3 == 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "STEP cannot be 0");
+            return;
+        }
+    }
+    basic_vars[idx]            = e1;
+    for_stack[for_sp].var_idx  = (uint16_t)idx;
+    for_stack[for_sp].target   = e2;
+    for_stack[for_sp].step     = e3;
+    /* Loop body starts at the line AFTER the current FOR line. */
+    for_stack[for_sp].loop_line = line_after(basic_pc);
+    for_sp++;
+    /* If the loop is already past the end on entry, skip the body. */
+    if ((e3 > 0 && e1 > e2) || (e3 < 0 && e1 < e2)) {
+        /* Empty body: pop immediately. There is no convenient way to scan
+         * forward to the matching NEXT here without a parser, so the
+         * common case is handled by NEXT itself terminating the loop
+         * on first iteration if the entry condition was already past
+         * the target. To match traditional BASIC, run the body once
+         * and then let NEXT terminate -- this matches BBC BASIC and
+         * most TinyBASIC variants. So: do nothing here. */
+    }
+}
+
+static void
+exec_next(const char **p)
+{
+    int   idx     = -1;
+    int   has_var;
+    basic_for_frame_t *f;
+    long  v;
+
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "NEXT outside RUN");
+        return;
+    }
+    if (for_sp == 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "NEXT without FOR");
+        return;
+    }
+    skip_ws(p);
+    has_var = parse_var(p, &idx);
+    f = &for_stack[for_sp - 1];
+    if (has_var && (uint16_t)idx != f->var_idx) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "NEXT mismatch");
+        return;
+    }
+    v = basic_vars[f->var_idx] + f->step;
+    basic_vars[f->var_idx] = v;
+    if ((f->step > 0 && v > f->target) ||
+        (f->step < 0 && v < f->target)) {
+        /* Loop done -- pop frame, fall through to next line. */
+        for_sp--;
+        return;
+    }
+    /* Loop continues -- jump back to the saved loop_line. */
+    if (f->loop_line == 0u) {
+        /* FOR was the last line of the program -- nothing to loop. */
+        for_sp--;
+        return;
+    }
+    basic_pc = f->loop_line;
+    basic_pc_set = 1;
+}
+
+/* Walk a single line of source (the text AFTER this IF's THEN) and find
+ * the ELSE that binds to *this* IF.  Returns a pointer inside @p src to
+ * the 'E' of that ELSE, or NULL if this IF has none.  Case-insensitive,
+ * word-bounded; characters inside double-quoted strings are skipped so a
+ * PRINT body containing the substring doesn't trigger a false match.
+ *
+ * Nesting (A6 fix): ELSE binds to the *nearest* IF, the conventional
+ * rule.  A nested `IF ... THEN` in the THEN-branch opens an inner IF that
+ * claims the next ELSE, so unmatched inner THENs are counted and only
+ * an ELSE once that count is zero.  Thus in
+ *     IF a THEN IF b THEN x ELSE y
+ * the ELSE binds to `IF b` (this function returns NULL for the outer IF),
+ * not to the outer IF as the old first-ELSE scan did. */
+static const char *
+scan_for_else(const char *src)
+{
+    const char *q = src;
+    int in_str  = 0;
+    int pending = 0;                 /* inner IF...THENs awaiting an ELSE */
+    while (*q != '\0') {
+        uint8_t b = (uint8_t)*q;
+        if (b == '"') { in_str = !in_str; q++; continue; }
+        if (in_str)   { q++; continue; }
+        /* A2: crunched keyword bytes (unambiguous, no boundary checks). */
+        if (b == BASIC_TOK_BYTE(THEN)) { pending++; q++; continue; }
+        if (b == BASIC_TOK_BYTE(ELSE)) {
+            if (pending > 0) { pending--; q++; continue; }
+            return q;
+        }
+        /* Raw text forms (immediate-mode lines are never crunched). */
+        if ((to_upper(q[0]) == 'T') && (to_upper(q[1]) == 'H') &&
+            (to_upper(q[2]) == 'E') && (to_upper(q[3]) == 'N')) {
+            char prev = (q == src) ? ' ' : q[-1];
+            if (!is_word_cont(prev) && !is_word_cont(q[4])) {
+                pending++;           /* an inner IF will claim the next ELSE */
+                q += 4;
+                continue;
+            }
+        }
+        if ((to_upper(q[0]) == 'E') && (to_upper(q[1]) == 'L') &&
+            (to_upper(q[2]) == 'S') && (to_upper(q[3]) == 'E')) {
+            char prev = (q == src) ? ' ' : q[-1];
+            if (!is_word_cont(prev) && !is_word_cont(q[4])) {
+                if (pending > 0) {
+                    pending--;        /* this ELSE closes an inner IF */
+                    q += 4;
+                    continue;
+                }
+                return q;             /* this ELSE binds to this IF */
+            }
+        }
+        q++;
+    }
+    return NULL;
+}
+
+#if TIKU_BASIC_GPIO_ENABLE
+/* Helper: parse `port, pin` (two integer args separated by a comma).
+ * Used by PIN and DIGWRITE; returns 0 on success with values stored,
+ * sets basic_error and returns -1 on syntax failure. */
+static int
+parse_port_pin(const char **p, long *port, long *pin)
+{
+    *port = parse_expr(p);
+    if (basic_error) return -1;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return -1;
+    }
+    cur_advance(p);
+    *pin = parse_expr(p);
+    if (basic_error) return -1;
+    return 0;
+}
+
+/* PIN port, pin, mode  -- mode 0 = input, 1 = output. */
+static void
+exec_pin(const char **p)
+{
+    long port, pin, mode;
+    int8_t rc;
+    if (parse_port_pin(p, &port, &pin) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return;
+    }
+    cur_advance(p);
+    mode = parse_expr(p);
+    if (basic_error) return;
+    rc = (mode == 0)
+            ? tiku_gpio_arch_set_input ((uint8_t)port, (uint8_t)pin)
+            : tiku_gpio_arch_set_output((uint8_t)port, (uint8_t)pin);
+    if (rc < 0) {
+        basic_throwf(TIKU_BASIC_ERR_SYNTAX, "bad GPIO P%ld.%ld", port, pin);
+    }
+}
+
+/* DIGWRITE port, pin, val  -- 0 / 1 / 2-or-other = toggle. */
+static void
+exec_digwrite(const char **p)
+{
+    long port, pin, val;
+    int8_t rc;
+    if (parse_port_pin(p, &port, &pin) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return;
+    }
+    cur_advance(p);
+    val = parse_expr(p);
+    if (basic_error) return;
+    rc = (val == 0 || val == 1)
+            ? tiku_gpio_arch_write ((uint8_t)port, (uint8_t)pin, (uint8_t)val)
+            : tiku_gpio_arch_toggle((uint8_t)port, (uint8_t)pin);
+    if (rc < 0) {
+        basic_throwf(TIKU_BASIC_ERR_SYNTAX, "bad GPIO P%ld.%ld", port, pin);
+    }
+}
+#endif
+
+#if TIKU_BASIC_I2C_ENABLE
+/* I2CWRITE addr, reg, val  -- writes 2 bytes [reg, val] to addr. */
+static void
+exec_i2cwrite(const char **p)
+{
+    long addr, reg, val;
+    uint8_t buf[2];
+
+    addr = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    reg = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    val = parse_expr(p);
+    if (basic_error) return;
+
+    if (basic_i2c_ensure() != 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "I2C init failed");
+        return;
+    }
+    buf[0] = (uint8_t)reg;
+    buf[1] = (uint8_t)val;
+    if (tiku_i2c_write((uint8_t)addr, buf, 2) != TIKU_I2C_OK) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "I2C write failed (addr=0x%02x)", (unsigned)addr);
+    }
+}
+#endif
+
+#if TIKU_BASIC_REBOOT_ENABLE
+/* REBOOT -- mirror what the shell `reboot` command does: configure the
+ * watchdog for a short interval and spin until it fires. Code after
+ * REBOOT is unreachable, so there is no return to exec_stmts. */
+static void
+exec_reboot(void)
+{
+    SHELL_PRINTF(SH_YELLOW "Rebooting..." SH_RST "\n");
+    tiku_watchdog_config(TIKU_WDT_MODE_WATCHDOG, TIKU_WDT_SRC_ACLK,
+                         TIKU_WDT_INTERVAL_64, 0, 1);
+    for (;;) { /* wait for the watchdog to fire */ }
+}
+#endif
+
+#if TIKU_BASIC_LED_ENABLE
+/* LED idx, val  -- val is 0 (off), 1 (on), or anything else (toggle).
+ * idx is 0-based; tiku_led_count() reports the board LED count. The
+ * underlying interface dispatches to per-board GPIO pins. */
+static void
+exec_led(const char **p)
+{
+    long idx, val;
+    idx = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    val = parse_expr(p);
+    if (basic_error) return;
+    if (idx < 0 || idx >= (long)tiku_led_count()) {
+        basic_throwf(TIKU_BASIC_ERR_RANGE, "bad LED %ld (count=%u)",
+                     idx, (unsigned)tiku_led_count());
+        return;
+    }
+    tiku_led_init((uint8_t)idx);
+    if      (val == 0) tiku_led_off   ((uint8_t)idx);
+    else if (val == 1) tiku_led_on    ((uint8_t)idx);
+    else               tiku_led_toggle((uint8_t)idx);
+}
+#endif
+
+#if TIKU_BASIC_VFS_ENABLE
+/* Helper: parse a quoted string literal into a stack buffer. Used by
+ * VFSREAD / VFSWRITE; lets BASIC programs name a path inline without
+ * needing the full string-vars infrastructure. Honors no escapes --
+ * VFS paths shouldn't contain them. Returns 0 on success, -1 on
+ * syntax / overflow with basic_error set. */
+static int
+parse_path_literal(const char **p, char *buf, size_t cap)
+{
+    size_t n = 0;
+    skip_ws(p);
+    if (cur_peek(p) != '"') {
+        basic_throw(TIKU_BASIC_ERR_IO, "quoted path expected");
+        return -1;
+    }
+    cur_advance(p);
+    while (cur_peek(p) != '\0' && cur_peek(p) != '"') {
+        if (n + 1 >= cap) {
+            basic_throw(TIKU_BASIC_ERR_IO, "path too long");
+            return -1;
+        }
+        buf[n++] = cur_peek(p);
+        cur_advance(p);
+    }
+    if (cur_peek(p) != '"') {
+        basic_throw(TIKU_BASIC_ERR_IO, "unterminated path");
+        return -1;
+    }
+    cur_advance(p);
+    buf[n] = '\0';
+    return 0;
+}
+
+/* VFSWRITE "path", val  -- writes val rendered as a decimal string
+ * into the VFS node. Useful for /dev/led0, /dev/gpio/X/Y, and other
+ * write-an-integer endpoints. */
+static void
+exec_vfswrite(const char **p)
+{
+    char path[48];
+    char render[16];
+    long val;
+    int  n;
+
+    if (parse_path_literal(p, path, sizeof(path)) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    val = parse_expr(p);
+    if (basic_error) return;
+    n = snprintf(render, sizeof(render), "%ld", val);
+    if (n < 0 || (size_t)n >= sizeof(render)) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "value render failed");
+        return;
+    }
+    n = tiku_vfs_write(path, render, (size_t)n);
+    if (n < 0) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "VFS write failed: %s (%s)", path, tiku_vfs_strerror(n));
+    }
+}
+
+/* VFSWRITE$ "path", str$ -- write a STRING value to a VFS node.  Pairs with
+ * VFSREAD$ for text nodes (/sys/device/name, /data files, ...); unlike
+ * VFSWRITE (which renders an integer) the string is written verbatim. */
+static void
+exec_vfswrite_str(const char **p)
+{
+    char path[48];
+    char val[TIKU_BASIC_STR_BUF_CAP];
+    int  rc;
+
+    if (parse_path_literal(p, path, sizeof(path)) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    if (parse_strexpr(p, val, sizeof(val)) != 0) return;
+    rc = tiku_vfs_write(path, val, strlen(val));
+    if (rc < 0) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "VFS write failed: %s (%s)", path, tiku_vfs_strerror(rc));
+    }
+}
+
+/* VFSREAD("path") -- read the node, parse the leading integer (decimal
+ * or 0x-prefixed hex via strtol base 0), return as long. Trims trailing
+ * whitespace so paths whose values include a newline don't trip the
+ * parser. */
+static long
+basic_vfsread(const char *path)
+{
+    char buf[32];
+    int  n;
+    char *end;
+    long v;
+
+    n = tiku_vfs_read(path, buf, sizeof(buf) - 1);
+    if (n < 0) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "VFS read failed: %s (%s)", path, tiku_vfs_strerror(n));
+        return 0;
+    }
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    buf[n] = '\0';
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' ||
+                     buf[n-1] == ' '  || buf[n-1] == '\t')) {
+        buf[--n] = '\0';
+    }
+    v = strtol(buf, &end, 0);
+    if (end == buf) {
+        /* No leading numeric prefix -- not a fatal error; many VFS
+         * nodes are status strings ("running", "off"). Return 0 so
+         * the program can keep going. */
+        return 0;
+    }
+    return v;
+}
+#endif
+
+#if TIKU_BASIC_RTC_ENABLE
+/* SETTIME <epoch> -- set the wall clock to an absolute Unix timestamp
+ * (seconds). Persisted by the RTC layer, so DATE$/TIME$/NOW read it back
+ * across reboots. Typically fed from an `ntp` fetch or a known constant. */
+static void
+exec_settime(const char **p)
+{
+    long secs = parse_expr(p);
+    if (basic_error) return;
+    if (secs < 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "SETTIME needs a non-negative epoch");
+        return;
+    }
+    tiku_rtc_set_seconds((uint32_t)secs);
+}
+#endif
+
+#if TIKU_BASIC_FILE_ENABLE
+/* Whole-file logging to /data (or any writable VFS path). TFS has no append
+ * primitive, so APPEND is read-modify-write bounded by this scratch buffer,
+ * which also caps a file at the TFS slot size on the target. */
+#ifndef TIKU_BASIC_FILE_BUF
+#define TIKU_BASIC_FILE_BUF 2048
+#endif
+static char basic_file_scratch[TIKU_BASIC_FILE_BUF];
+
+/* APPEND "path", expr$ -- append the string plus a newline, preserving the
+ * existing contents. Errors (never silently truncates) if the result would
+ * exceed the scratch buffer / slot. */
+static void
+exec_append(const char **p)
+{
+    char path[48];
+    char val[TIKU_BASIC_STR_BUF_CAP];
+    int  have, vlen, total;
+
+    if (parse_path_literal(p, path, sizeof(path)) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    if (parse_strexpr(p, val, sizeof(val)) != 0) return;
+
+    have = tiku_vfs_read(path, basic_file_scratch,
+                         (size_t)(TIKU_BASIC_FILE_BUF - 2));
+    if (have < 0) have = 0;                       /* file doesn't exist yet */
+    vlen  = (int)strlen(val);
+    total = have + vlen + 1;                       /* +1 for the newline */
+    if (total > TIKU_BASIC_FILE_BUF) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "file full (max %d bytes)", (int)TIKU_BASIC_FILE_BUF);
+        return;
+    }
+    memcpy(basic_file_scratch + have, val, (size_t)vlen);
+    basic_file_scratch[have + vlen] = '\n';
+    if (tiku_vfs_write(path, basic_file_scratch, (size_t)total) < 0) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "write failed: %s", path);
+    }
+}
+
+/* FWRITE "path", expr$ -- truncating whole-file write (no trailing newline). */
+static void
+exec_fwrite(const char **p)
+{
+    char path[48];
+    char val[TIKU_BASIC_STR_BUF_CAP];
+
+    if (parse_path_literal(p, path, sizeof(path)) != 0) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected"); return;
+    }
+    cur_advance(p);
+    if (parse_strexpr(p, val, sizeof(val)) != 0) return;
+    if (tiku_vfs_write(path, val, strlen(val)) < 0) {
+        basic_throwf(TIKU_BASIC_ERR_IO, "write failed: %s", path);
+    }
+}
+#endif
+
+#if TIKU_BASIC_PEEK_POKE_ENABLE
+static void
+exec_poke(const char **p)
+{
+    long addr = parse_expr(p);
+    long val;
+    if (basic_error) return;
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return;
+    }
+    cur_advance(p);
+    val = parse_expr(p);
+    if (basic_error) return;
+    basic_poke(addr, val);
+}
+#endif
+
+static void
+exec_cls(void)
+{
+    /* ANSI clear screen + cursor home. Correct for any UART backend
+     * driving a VT100-class terminal; on raw / framebuffer backends
+     * the escape bytes are harmless noise. */
+    SHELL_PRINTF("\033[2J\033[H");
+}
+
+/* Busy-wait for `ms` milliseconds. Polls Ctrl-C between iterations
+ * so a runaway DELAY can be interrupted from the keyboard. The
+ * granularity is one tick (TIKU_CLOCK_SECOND Hz, so ~7.81 ms at the
+ * default 128 Hz). Negative or zero argument returns immediately.
+ * Bounded by tiku_clock_time_t's 16-bit width: roughly 256 s safe
+ * at 128 Hz; for longer waits, chain DELAYs. */
+/* Can the current wait yield (park the step machine) instead of spinning?
+ * Shell mode only, during RUN, from the MAIN line walker -- nested contexts
+ * (IF-THEN scratch, EVERY bodies via the reactive poll) keep the blocking
+ * path because their transient buffers cannot be resumed across ticks. */
+static int
+basic_wait_can_yield(void)
+{
+    return basic_run_shell_mode && basic_running &&
+           !basic_in_reactive && basic_stmt_depth == 1;
+}
+
+static void
+exec_delay_ms(long ms)
+{
+    tiku_clock_time_t  start;
+    tiku_clock_time_t  ticks;
+    if (ms <= 0) return;
+    start = tiku_clock_time();
+    ticks = TIKU_CLOCK_MS_TO_TICKS((unsigned long)ms);
+    if (ticks == 0u) return;
+    if (basic_wait_can_yield()) {
+        /* Park the step machine instead of spinning: the shell loop keeps
+         * pumping (events dispatch, Ctrl-C arrives via feed_char), and the
+         * run resumes this line's remainder after the deadline. */
+        basic_wait_start   = start;
+        basic_wait_ticks   = ticks;
+        basic_wait_sleep_s = 0;
+        basic_wait_pending = 1;
+        return;
+    }
+    while ((tiku_clock_time_t)(tiku_clock_time() - start) < ticks) {
+#if TIKU_SHELL_CMD_SLIP
+        /* SLIP-aware break check: demux IP frames away so a 0x03 byte inside
+         * network traffic on the shared console UART (e.g. a connection's
+         * teardown after a BROWSE) is not misread as Ctrl-C, and the net stack
+         * is pumped so that teardown completes during the wait. */
+        {
+            int ch = tiku_shell_net_getc();
+            if (ch == BASIC_CTRL_C) {
+                basic_error = 1;
+                SHELL_PRINTF(SH_YELLOW "^C\n" SH_RST);
+                return;
+            }
+        }
+#else
+        tiku_watchdog_kick();   /* feed the hang detector; see read_line */
+        if (tiku_shell_io_rx_ready()) {
+            int ch = tiku_shell_io_getc();
+            if (ch == BASIC_CTRL_C) {
+                basic_error = 1;
+                SHELL_PRINTF(SH_YELLOW "^C\n" SH_RST);
+                return;
+            }
+        }
+#endif
+    }
+}
+
+static void
+exec_delay(const char **p)
+{
+    long ms = parse_expr(p);
+    if (basic_error) return;
+    exec_delay_ms(ms);
+}
+
+/* Low-power wait for `ticks` kernel ticks.  Unlike exec_delay_ms (a busy
+ * spin, kept for DELAY's short precise waits), this enters the platform's
+ * DEEP idle between wakes, so the CPU actually goes low-power for the
+ * duration -- the point of SLEEP on a microwatt part.  DEEP keeps the
+ * kernel tick alive on every supported target (MSP430 LPM3 wakes on the
+ * Timer_A ISR; the Ambiq/RP2350 tick survives WFI), so the core wakes at
+ * least once per tick to re-check the deadline and poll Ctrl-C; DEEPEST
+ * would gate the tick and never wake, so it is deliberately not used.
+ * `ticks` must stay below half the tick counter's range for the
+ * wrap-safe compare -- exec_sleep chunks large sleeps to guarantee this.
+ * If the platform offers no DEEP hook the loop degrades to a spin that
+ * still honours the deadline. */
+static void
+basic_lp_wait_ticks(tiku_clock_time_t ticks)
+{
+    tiku_clock_time_t     start = tiku_clock_time();
+    tiku_cpu_idle_enter_t idle  = tiku_cpu_idle_hook(TIKU_CPU_IDLE_DEEP);
+    if (ticks == 0u) return;
+    while ((tiku_clock_time_t)(tiku_clock_time() - start) < ticks) {
+#if TIKU_SHELL_CMD_SLIP
+        if (tiku_shell_net_getc() == BASIC_CTRL_C) {
+            basic_error = 1;
+            SHELL_PRINTF(SH_YELLOW "^C\n" SH_RST);
+            return;
+        }
+#else
+        tiku_watchdog_kick();   /* feed the hang detector; see read_line */
+        if (tiku_shell_io_rx_ready() &&
+            tiku_shell_io_getc() == BASIC_CTRL_C) {
+            basic_error = 1;
+            SHELL_PRINTF(SH_YELLOW "^C\n" SH_RST);
+            return;
+        }
+#endif
+        if (idle) idle();     /* WFI/LPM until the next interrupt (>=1/tick) */
+    }
+}
+
+static void
+exec_sleep(const char **p)
+{
+    long s = parse_expr(p);
+    if (basic_error) return;
+    if (s <= 0) return;
+    /* SLEEP N -- go low-power for N seconds.  Chunked into <=10 s waits
+     * so each stays well under the tick counter's wrap regardless of the
+     * platform tick rate (10 s is <32k ticks up to ~3.2 kHz).  Unlike
+     * DELAY, this enters DEEP idle: the microwatt-part use case is
+     * "go dark for a while", not a precise busy pause.  Ctrl-C aborts;
+     * the 24 h cap is a sanity bound, not a hardware limit. */
+    if (s > 86400L) s = 86400L;
+    if (basic_wait_can_yield()) {
+        /* Park (first <=10 s chunk now, the step machine re-arms the rest):
+         * in mode the kernel idles the core between poll ticks, so the
+         * low-power goal is met by yielding rather than by spinning in the
+         * DEEP-idle loop below. */
+        long chunk = (s > 10L) ? 10L : s;
+        basic_wait_start   = tiku_clock_time();
+        basic_wait_ticks   =
+            (tiku_clock_time_t)((tiku_clock_time_t)chunk * TIKU_CLOCK_SECOND);
+        basic_wait_sleep_s = s - chunk;
+        basic_wait_pending = 1;
+        return;
+    }
+    while (s > 0L && !basic_error) {
+        long chunk = (s > 10L) ? 10L : s;
+        basic_lp_wait_ticks(
+            (tiku_clock_time_t)((tiku_clock_time_t)chunk * TIKU_CLOCK_SECOND));
+        s -= chunk;
+    }
+}
+
+/* EVERY ms : stmt  -- register a recurring statement. The RUN loop
+ * polls each registration between program lines and fires it when
+ * the interval has elapsed (wrap-aware via the tick counter).
+ *
+ * Scope: cleared at every RUN start. Use inside saved programs to
+ * build periodic blink / sample / report patterns. */
+static void
+exec_every(const char **p)
+{
+    long ms;
+    int i, slot = -1;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "EVERY outside RUN");
+        return;
+    }
+    ms = parse_expr(p);
+    if (basic_error) return;
+    if (ms <= 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "EVERY interval must be > 0");
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != ':') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "':' expected");
+        return;
+    }
+    cur_advance(p);
+    skip_ws(p);
+    for (i = 0; i < TIKU_BASIC_EVERY_MAX; i++) {
+        if (!basic_everys[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "EVERY table full");
+        return;
+    }
+    {
+        size_t n = 0;
+        while (cur_peek(p) && n + 1u < sizeof(basic_everys[slot].stmt)) {
+            basic_everys[slot].stmt[n++] = cur_peek(p);
+            cur_advance(p);
+        }
+        if (cur_peek(p) != '\0') {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EVERY stmt too long");
+            return;
+        }
+        basic_everys[slot].stmt[n] = '\0';
+    }
+    basic_everys[slot].interval_ms = ms;
+    basic_everys[slot].next_due_ms =
+        (long)tiku_clock_time() * 1000L / (long)TIKU_CLOCK_SECOND + ms;
+    basic_everys[slot].active = 1;
+}
+
+#if TIKU_BASIC_ONCHG_EVENT
+/* F2: resolve an ON CHANGE slot's node and, if it is WRITABLE, subscribe the
+ * shell process so writes deliver TIKU_EVENT_VFS (event-driven; the poll tick
+ * then skips it).  Sensor/read-only or unresolved nodes stay polled.  This is
+ * idempotent -- tiku_vfs_watch dedups -- so the mode tick re-calls it every
+ * pass to self-heal after the rules engine's wholesale unwatch_all(). */
+static void
+basic_onchg_arm(basic_onchg_t *o)
+{
+    o->node = tiku_vfs_resolve(o->path);
+    /* Event-arm ONLY in shell mode: the synchronous exec_run driver blocks
+     * the shell loop, so TIKU_EVENT_VFS could never dispatch mid-run there
+     * -- an armed slot would gate on a pending mark that cannot arrive.
+     * The sync driver keeps the per-pass poll instead. */
+    if (basic_run_shell_mode &&
+        o->node != NULL && o->node->write != NULL) {
+        (void)tiku_vfs_watch(o->path, &tiku_shell_process);
+        o->armed = 1;
+    } else {
+        o->armed = 0;
+    }
+}
+#endif
+
+/* ON CHANGE "/path" GOTO line   or   ... GOSUB line
+ * Registers a reactive watch. Writable nodes are event-armed via
+ * tiku_vfs_watch (F2); sensor/read-only nodes are polled by the RUN loop.
+ * On value change it either jumps (GOTO) or pushes a return address (GOSUB)
+ * to the handler. The "last value" baseline is captured at register time, so
+ * a watch never fires on its own first read. */
+static void
+exec_on_change(const char **p)
+{
+    char path[40];
+    long line;
+    int  is_gosub = 0;
+    int  i, slot = -1;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "ON CHANGE outside RUN");
+        return;
+    }
+    if (parse_path_literal(p, path, sizeof(path)) != 0) return;
+    skip_ws(p);
+    if      (match_kw(p, "GOTO"))  is_gosub = 0;
+    else if (match_kw(p, "GOSUB")) is_gosub = 1;
+    else {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "GOTO or GOSUB expected");
+        return;
+    }
+    line = parse_expr(p);
+    if (basic_error) return;
+    if (line <= 0 || line >= 0xFFFE) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad handler line");
+        return;
+    }
+    for (i = 0; i < TIKU_BASIC_ONCHG_MAX; i++) {
+        if (!basic_onchgs[i].active) { slot = i; break; }
+    }
+    if (slot < 0) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "ON CHANGE table full");
+        return;
+    }
+    strncpy(basic_onchgs[slot].path, path,
+            sizeof(basic_onchgs[slot].path));
+    basic_onchgs[slot].path[sizeof(basic_onchgs[slot].path) - 1] = '\0';
+    basic_onchgs[slot].handler_line = (uint16_t)line;
+    basic_onchgs[slot].is_gosub     = (uint8_t)is_gosub;
+    basic_onchgs[slot].last_value   = basic_vfsread(path);
+    basic_onchgs[slot].active       = 1;
+    /* basic_vfsread sets basic_error on path resolution failure --
+     * if so, undo the registration. */
+    if (basic_error) {
+        basic_onchgs[slot].active = 0;
+        return;
+    }
+#if TIKU_BASIC_ONCHG_EVENT
+    basic_onchgs[slot].pending = 0;         /* arena memory is not zeroed */
+    basic_onchg_arm(&basic_onchgs[slot]);   /* event-arm if writable */
+#endif
+}
+
+/* Re-read one ON CHANGE slot's value and, if it changed, fire its handler
+ * (GOTO jump / GOSUB push+jump); return 1 iff it fired.  Called only at a
+ * statement boundary, so the GOSUB return address (line_after(basic_pc)) is
+ * correct.  Shared by the poll tick and the event path (F2). */
+static int
+basic_onchg_check(basic_onchg_t *o)
+{
+    long v = basic_vfsread(o->path);
+    if (basic_error) {                 /* read failure -- silence and skip */
+        basic_error = 0;
+        return 0;
+    }
+    if (v == o->last_value) {
+        return 0;
+    }
+    o->last_value = v;
+    if (o->is_gosub) {
+        if (gosub_sp >= TIKU_BASIC_GOSUB_DEPTH) {
+            return 0;                  /* stack full -- no re-fire */
+        }
+        gosub_stack[gosub_sp++] = line_after(basic_pc);
+    }
+    basic_pc     = o->handler_line;
+    basic_pc_set = 1;
+    return 1;
+}
+
+/* Called from the RUN loop between program statements. Walks the
+ * EVERY and ON CHANGE registrations and fires any that are due.
+ * Errors inside a fired handler bubble up via basic_error like any
+ * other statement and reach the RUN-loop error trap. */
+static void
+basic_poll_reactive(void)
+{
+    int i;
+    long now_ms;
+#if TIKU_BASIC_EVERY_MAX > 0
+    now_ms = (long)tiku_clock_time() * 1000L / (long)TIKU_CLOCK_SECOND;
+    for (i = 0; i < TIKU_BASIC_EVERY_MAX; i++) {
+        if (!basic_everys[i].active) continue;
+        /* Wrap-tolerant compare: on reaching or passing the
+         * scheduled time, fire. */
+        if (now_ms >= basic_everys[i].next_due_ms) {
+            const char *p = basic_everys[i].stmt;
+            exec_stmts(&p);
+            if (basic_error) {
+                /* Deactivate the broken handler so it does not keep
+                 * re-firing on every poll. */
+                basic_everys[i].active = 0;
+                return;
+            }
+            basic_everys[i].next_due_ms = now_ms +
+                                          basic_everys[i].interval_ms;
+        }
+    }
+#endif
+#if TIKU_BASIC_ONCHG_MAX > 0
+    for (i = 0; i < TIKU_BASIC_ONCHG_MAX; i++) {
+        if (!basic_onchgs[i].active) continue;
+#if TIKU_BASIC_ONCHG_EVENT
+        /* Event-armed (writable) node: only re-check when an event has marked
+         * it pending -- no VFSREAD every tick.  Firing still happens here, at
+         * a statement boundary, so the GOSUB return address is correct. */
+        if (basic_onchgs[i].armed) {
+            if (!basic_onchgs[i].pending) continue;
+            basic_onchgs[i].pending = 0;
+        }
+#endif
+        if (basic_onchg_check(&basic_onchgs[i])) {
+            return;        /* one handler per poll */
+        }
+    }
+#endif
+}
+
+/* RESUME [NEXT | line]
+ * RESUME       -- continue from the line that errored
+ * RESUME NEXT  -- continue from the line after the one that errored
+ * RESUME line  -- continue from a specific line
+ * Only meaningful inside an ON-ERROR handler. */
+static void
+exec_resume(const char **p)
+{
+    long target;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "RESUME outside RUN");
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) == '\0' || cur_peek(p) == ':') {
+        basic_pc     = basic_err_pc;
+        basic_pc_set = 1;
+        return;
+    }
+    if (match_kw(p, "NEXT")) {
+        int n = prog_next_index((uint16_t)(basic_err_pc + 1));
+        if (n < 0) {
+            basic_running = 0;
+            basic_pc = 0;
+            return;
+        }
+        basic_pc     = prog[n].number;
+        basic_pc_set = 1;
+        return;
+    }
+    target = parse_expr(p);
+    if (basic_error) return;
+    basic_pc     = (uint16_t)target;
+    basic_pc_set = 1;
+}
+
+/* ON expr GOTO l1, l2, ...   /   ON expr GOSUB l1, l2, ...
+ * ON ERROR GOTO line          (or ON ERROR GOTO 0 to clear)
+ * ON CHANGE "/path" GOTO line (registers a reactive watch -- handled
+ *                              in exec_on_change below)
+ * Computed-dispatch path: if expr=N, jump to the Nth target. */
+static void
+exec_on(const char **p)
+{
+    long sel;
+    int  is_gosub;
+    long target = 0;
+    long n;
+    skip_ws(p);
+    if (match_kw(p, "CHANGE")) { exec_on_change(p); return; }
+    /* ON ERROR GOTO line  -- set or clear the run-time error handler. */
+    if (match_kw(p, "ERROR")) {
+        skip_ws(p);
+        if (!match_kw(p, "GOTO")) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "GOTO expected");
+            return;
+        }
+        target = parse_expr(p);
+        if (basic_error) return;
+        if (target < 0 || target >= 0xFFFE) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad handler line");
+            return;
+        }
+        basic_err_handler = (uint16_t)target;     /* 0 = disabled */
+        return;
+    }
+    /* ON TIMER n GOSUB L (or GOTO L) -- sugar for EVERY n : GOSUB L.  Reads
+     * better than EVERY for periodic tasks and reuses the EVERY registry. */
+    if (match_kw(p, "TIMER")) {
+        long ms, ln;
+        int  is_gsub, i, slot = -1;
+        if (!basic_running) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "ON outside RUN");
+            return;
+        }
+        ms = parse_expr(p);
+        if (basic_error) return;
+        if (ms <= 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "EVERY interval must be > 0");
+            return;
+        }
+        skip_ws(p);
+        if      (match_kw(p, "GOSUB")) is_gsub = 1;
+        else if (match_kw(p, "GOTO"))  is_gsub = 0;
+        else {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "GOTO or GOSUB expected");
+            return;
+        }
+        ln = parse_expr(p);
+        if (basic_error) return;
+        if (ln < 0 || ln >= 0xFFFE) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad handler line");
+            return;
+        }
+        for (i = 0; i < TIKU_BASIC_EVERY_MAX; i++) {
+            if (!basic_everys[i].active) { slot = i; break; }
+        }
+        if (slot < 0) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "EVERY table full");
+            return;
+        }
+        snprintf(basic_everys[slot].stmt, sizeof(basic_everys[slot].stmt),
+                 "%s %ld", is_gsub ? "GOSUB" : "GOTO", ln);
+        basic_everys[slot].interval_ms = ms;
+        basic_everys[slot].next_due_ms =
+            (long)tiku_clock_time() * 1000L / (long)TIKU_CLOCK_SECOND + ms;
+        basic_everys[slot].active = 1;
+        return;
+    }
+
+    sel = parse_expr(p);
+    if (basic_error) return;
+    skip_ws(p);
+    if      (match_kw(p, "GOTO"))  is_gosub = 0;
+    else if (match_kw(p, "GOSUB")) is_gosub = 1;
+    else {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "GOTO or GOSUB expected");
+        return;
+    }
+    /* Walk the comma-separated target list, recording the sel'th
+     * value. Always parse all of them so the cursor ends up at end-
+     * of-stmt regardless of which entry was picked. */
+    n = 1;
+    while (1) {
+        long v = parse_expr(p);
+        if (basic_error) return;
+        if (n == sel) target = v;
+        skip_ws(p);
+        if (cur_peek(p) != ',') break;
+        cur_advance(p);
+        n++;
+    }
+    if (target == 0) return;          /* sel out of range -> no-op */
+
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "ON outside RUN");
+        return;
+    }
+    if (is_gosub) {
+        if (gosub_sp >= TIKU_BASIC_GOSUB_DEPTH) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "GOSUB stack overflow");
+            return;
+        }
+        gosub_stack[gosub_sp++] = line_after(basic_pc);
+    }
+    basic_pc     = (uint16_t)target;
+    basic_pc_set = 1;
+}
+
+/* TRACE ON / TRACE OFF -- toggle line-echo during RUN. */
+static void
+exec_trace(const char **p)
+{
+    skip_ws(p);
+    if      (match_kw(p, "ON"))  basic_trace = 1;
+    else if (match_kw(p, "OFF")) basic_trace = 0;
+    else {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "ON or OFF expected");
+    }
+}
+
+/* PERSIST ON / PERSIST OFF -- F1: arm/disarm execution-state checkpointing so a
+ * running program can survive a reset / power cut and be continued with RUN
+ * RESUME.  Distinct from SAVE (which persists the program text): PERSIST
+ * persists the running machine. */
+static void
+exec_persist(const char **p)
+{
+    skip_ws(p);
+#if TIKU_BASIC_PERSIST_RUN_ENABLE
+    if (match_kw(p, "ON")) {
+        basic_ckpt_arm(1);
+    } else if (match_kw(p, "OFF")) {
+        basic_ckpt_arm(0);
+    } else {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "ON or OFF expected");
+    }
+#else
+    (void)p;
+    basic_throw(TIKU_BASIC_ERR_GENERAL, "PERSIST unsupported on this build");
+#endif
+}
+
+/* RESTORE -- reset the DATA read pointer to the start. Subsequent
+ * READs walk the DATA list from the beginning again. */
+static void
+exec_restore(void)
+{
+    basic_data_idx = -1;
+    basic_data_off = 0;
+}
+
+/* Find the prog[] index of the first DATA line whose number is >=
+ * `from_lineno`, or -1 if none. Sets *out_off to the byte offset
+ * inside that line's text immediately after the DATA keyword (so
+ * the caller can resume parsing values from there). */
+static int
+data_find_next_line(uint16_t from_lineno, int *out_off)
+{
+    int n = prog_next_index(from_lineno);
+    while (n >= 0) {
+        const char *t = prog[n].text;
+        size_t      k;
+        skip_ws(&t);
+        k = tok_kw_at(t, "DATA");            /* token byte or raw text */
+        if (k != 0) {
+            *out_off = (int)((t + k) - prog[n].text);
+            return n;
+        }
+        if (prog[n].number == 0xFFFFu) break;
+        n = prog_next_index((uint16_t)(prog[n].number + 1));
+    }
+    return -1;
+}
+
+/* At the current (basic_data_idx, basic_data_off), advance past any
+ * delimiting whitespace and commas, returning 1 if a value is
+ * available. At end-of-line, walk forward to the next DATA
+ * statement. Sets basic_data_idx = -2 to mark exhaustion so as not to
+ * keep re-scanning the program. */
+static int
+data_seek_value(void)
+{
+    while (1) {
+        if (basic_data_idx == -2) return 0;
+        if (basic_data_idx < 0) {
+            int idx = data_find_next_line(0, &basic_data_off);
+            if (idx < 0) { basic_data_idx = -2; return 0; }
+            basic_data_idx = idx;
+        }
+        {
+            const char *t = prog[basic_data_idx].text + basic_data_off;
+            skip_ws(&t);
+            if (*t == ',') { t++; skip_ws(&t); }
+            if (*t != '\0') {
+                basic_data_off = (int)(t - prog[basic_data_idx].text);
+                return 1;
+            }
+        }
+        /* Exhausted this DATA line -- walk forward to find another. */
+        {
+            uint16_t cur_no = prog[basic_data_idx].number;
+            int      next;
+            if (cur_no == 0xFFFFu) { basic_data_idx = -2; return 0; }
+            next = data_find_next_line((uint16_t)(cur_no + 1),
+                                        &basic_data_off);
+            if (next < 0) { basic_data_idx = -2; return 0; }
+            basic_data_idx = next;
+        }
+    }
+}
+
+/* READ var [, var ...] -- consume DATA values into variables. Only
+ * works inside RUN (DATA lines are walked in line-number order).
+ * Both numeric (READ A) and string (READ A$) targets are supported;
+ * the DATA item type must match -- a quoted "..." is a string item,
+ * an unquoted token is parsed as a numeric expression. */
+static void
+exec_read(const char **p)
+{
+    int  idx;
+    long v;
+    char c;
+    int  is_string;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "READ outside RUN");
+        return;
+    }
+    while (1) {
+        skip_ws(p);
+        c = to_upper(cur_peek(p));
+        if (c < 'A' || c > 'Z') {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+            return;
+        }
+        idx = c - 'A';
+        is_string = 0;
+#if TIKU_BASIC_STRVARS_ENABLE
+        if (cur_peek_at(p, 1) == '$' && !is_word_cont(cur_peek_at(p, 2))) {
+            is_string = 1;
+            cur_skip(p, 2);
+        } else
+#endif
+        {
+            if (is_word_cont(cur_peek_at(p, 1))) {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad variable");
+                return;
+            }
+            cur_advance(p);
+        }
+        if (!data_seek_value()) {
+            basic_throw(TIKU_BASIC_ERR_RANGE, "out of DATA");
+            return;
+        }
+        {
+            const char *t = prog[basic_data_idx].text + basic_data_off;
+#if TIKU_BASIC_STRVARS_ENABLE
+            if (is_string) {
+                char buf[TIKU_BASIC_STR_BUF_CAP];
+                size_t n = 0;
+                skip_ws(&t);
+                if (*t == '"') {
+                    /* Quoted string item: same escapes as PRINT. */
+                    t++;
+                    while (*t && *t != '"') {
+                        char ch;
+                        if (*t == '\\' && *(t + 1)) {
+                            ch = print_escape(*(t + 1));
+                            t += 2;
+                        } else {
+                            ch = *t++;
+                        }
+                        if (n + 1u >= sizeof(buf)) break;
+                        buf[n++] = ch;
+                    }
+                    if (*t == '"') t++;
+                } else {
+                    /* Unquoted: read until comma / whitespace / end. */
+                    while (*t && *t != ',' && *t != ' ' && *t != '\t') {
+                        if (n + 1u >= sizeof(buf)) break;
+                        buf[n++] = *t++;
+                    }
+                }
+                buf[n] = '\0';
+                basic_data_off = (int)(t - prog[basic_data_idx].text);
+                basic_strvars[idx] = basic_str_alloc(buf, strlen(buf));
+                if (basic_strvars[idx] == NULL) {
+                    basic_throw(TIKU_BASIC_ERR_NOMEM, "out of string heap");
+                    return;
+                }
+            } else
+#endif
+            {
+                v = parse_expr(&t);
+                if (basic_error) return;
+                basic_data_off = (int)(t - prog[basic_data_idx].text);
+                basic_vars[idx] = v;
+            }
+        }
+        skip_ws(p);
+        if (cur_peek(p) != ',') return;
+        cur_advance(p);
+    }
+}
+
+/* DATA - executed as a statement is a no-op; values are consumed
+ * lazily by READ via the data_seek_value helper. */
+static void
+exec_data_noop(const char **p)
+{
+    /* Skip everything until end-of-line / colon ... actually, DATA
+     * carries arbitrary values up to end-of-line, but a colon could
+     * legitimately end it. For simplicity, treat colons inside DATA
+     * as part of the data. The simplest, correct thing is to drop
+     * the rest of the line, like REM does -- READ is what parses
+     * DATA contents. */
+    while (cur_peek(p)) cur_advance(p);
+}
+
+#if TIKU_BASIC_ARRAYS_ENABLE
+/* DIM A(n)              -- 1D integer array
+ * DIM A(m, n)           -- 2D integer array
+ * DIM A$(n)             -- 1D string array (each element NULL)
+ * DIM A$(m, n)          -- 2D string array
+ * Multiple DIMs separated by commas in a single statement.
+ * Element max per dimension is TIKU_BASIC_ARRAY_MAX; total element
+ * count must also fit. Re-DIM of the same name (numeric A and string
+ * A$ are independent slots) is an error within a session.
+ *
+ * Storage:
+ *   - 1D: dim1 = size, dim2 = 0; flat[i]
+ *   - 2D: dim1 = m,    dim2 = n; flat[i * n + j]
+ */
+static void
+exec_dim(const char **p)
+{
+    while (1) {
+        long d1, d2;
+        char c;
+        int  aidx;
+        int  is_str = 0;
+        size_t total;
+        basic_array_t *slot;
+
+        skip_ws(p);
+        c = to_upper(cur_peek(p));
+        if (c < 'A' || c > 'Z') {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+            return;
+        }
+        aidx = c - 'A';
+#if TIKU_BASIC_STRVARS_ENABLE
+        if (cur_peek_at(p, 1) == '$' && !is_word_cont(cur_peek_at(p, 2))) {
+            is_str = 1;
+            cur_skip(p, 2);
+        } else
+#endif
+        {
+            if (is_word_cont(cur_peek_at(p, 1))) {
+                basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad variable");
+                return;
+            }
+            cur_advance(p);
+        }
+        skip_ws(p);
+        if (cur_peek(p) != '(') {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "'(' expected"); return;
+        }
+        cur_advance(p);
+        d1 = parse_expr(p);
+        if (basic_error) return;
+        d2 = 0;
+        skip_ws(p);
+        if (cur_peek(p) == ',') {
+            cur_advance(p);
+            d2 = parse_expr(p);
+            if (basic_error) return;
+            skip_ws(p);
+        }
+        if (cur_peek(p) != ')') {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected"); return;
+        }
+        cur_advance(p);
+        if (d1 < 1 || d1 > TIKU_BASIC_ARRAY_MAX ||
+            d2 < 0 || d2 > TIKU_BASIC_ARRAY_MAX) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "bad array size");
+            return;
+        }
+        total = (size_t)d1 * (size_t)(d2 == 0 ? 1 : d2);
+        if (total > (size_t)TIKU_BASIC_ARRAY_MAX) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "array too big");
+            return;
+        }
+#if TIKU_BASIC_STRVARS_ENABLE
+        slot = is_str ? &basic_str_arrays[aidx] : &basic_arrays[aidx];
+#else
+        (void)is_str;
+        slot = &basic_arrays[aidx];
+#endif
+        if (slot->data != NULL) {
+            basic_throwf(TIKU_BASIC_ERR_GENERAL, "array %c already DIMmed", c);
+            return;
+        }
+        slot->dim1      = (uint16_t)d1;
+        slot->dim2      = (uint16_t)d2;
+        slot->is_string = (uint8_t)is_str;
+#if TIKU_BASIC_STRVARS_ENABLE
+        if (is_str) {
+            slot->data = (char **)tiku_arena_alloc(&basic_arena,
+                (tiku_mem_arch_size_t)(sizeof(char *) * total));
+            if (slot->data == NULL) {
+                basic_throw(TIKU_BASIC_ERR_NOMEM, "out of memory for array");
+                return;
+            }
+            {
+                char **p2 = (char **)slot->data;
+                size_t i;
+                for (i = 0; i < total; i++) p2[i] = NULL;
+            }
+        } else
+#endif
+        {
+            slot->data = (long *)tiku_arena_alloc(&basic_arena,
+                (tiku_mem_arch_size_t)(sizeof(long) * total));
+            if (slot->data == NULL) {
+                basic_throw(TIKU_BASIC_ERR_NOMEM, "out of memory for array");
+                return;
+            }
+            {
+                long *p2 = (long *)slot->data;
+                size_t i;
+                for (i = 0; i < total; i++) p2[i] = 0;
+            }
+        }
+        skip_ws(p);
+        if (cur_peek(p) != ',') return;
+        cur_advance(p);
+    }
+}
+
+/* Parse `(i [, j])` after a leading letter, returning the linear
+ * offset for that array's element. *p must already be past the
+ * opening `(`. Sets basic_error and returns -1 on out-of-range. */
+static long
+parse_array_index(const char **p, basic_array_t *slot, char letter)
+{
+    long i, j;
+    long off;
+    i = parse_expr(p);
+    if (basic_error) return -1;
+    skip_ws(p);
+    if (cur_peek(p) == ',') {
+        cur_advance(p);
+        j = parse_expr(p);
+        if (basic_error) return -1;
+        skip_ws(p);
+    } else {
+        j = -1;
+    }
+    if (cur_peek(p) != ')') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected"); return -1;
+    }
+    cur_advance(p);
+    if (slot->data == NULL) {
+        basic_throwf(TIKU_BASIC_ERR_GENERAL, "array %c not DIMmed", letter);
+        return -1;
+    }
+    if (slot->dim2 == 0) {
+        if (j >= 0) {
+            basic_throwf(TIKU_BASIC_ERR_GENERAL, "array %c is 1D", letter);
+            return -1;
+        }
+        if (i < 0 || i >= (long)slot->dim1) {
+            basic_throwf(TIKU_BASIC_ERR_RANGE, "array index %ld out of range", i);
+            return -1;
+        }
+        off = i;
+    } else {
+        if (j < 0) {
+            basic_throwf(TIKU_BASIC_ERR_GENERAL, "array %c needs 2 indices", letter);
+            return -1;
+        }
+        if (i < 0 || i >= (long)slot->dim1 ||
+            j < 0 || j >= (long)slot->dim2) {
+            basic_throw(TIKU_BASIC_ERR_RANGE, "array index out of range");
+            return -1;
+        }
+        off = i * (long)slot->dim2 + j;
+    }
+    return off;
+}
+#endif
+
+#if TIKU_BASIC_DEFN_ENABLE
+/* DEF FN name(a [, b, ...]) = body  -- register a single-line user
+ * function. Body is stored verbatim and re-parsed on each call.
+ * Up to TIKU_BASIC_DEFN_ARGS arguments (default 4); each must be a
+ * single-letter variable name. The argument variables' values are
+ * saved before the call and restored after, so DEF FN inc(X)
+ * doesn't clobber a caller's X. Only numeric (int) values. */
+static void
+exec_def(const char **p)
+{
+    char    nm[8];
+    size_t  nlen = 0;
+    int     i;
+    int     slot = -1;
+    size_t  blen;
+    uint8_t args[TIKU_BASIC_DEFN_ARGS];
+    uint8_t argc = 0;
+
+    skip_ws(p);
+    if (!match_kw(p, "FN")) {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "FN expected");
+        return;
+    }
+    skip_ws(p);
+    while (is_word_cont(cur_peek(p)) && nlen + 1u < sizeof(nm)) {
+        nm[nlen++] = (char)to_upper(cur_peek(p));
+        cur_advance(p);
+    }
+    nm[nlen] = '\0';
+    if (nlen < 2u) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "function name >= 2 chars");
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != '(') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'(' expected"); return;
+    }
+    cur_advance(p);
+
+    /* Comma-separated list of single-letter argument variables. */
+    while (1) {
+        char c;
+        skip_ws(p);
+        c = to_upper(cur_peek(p));
+        if (c < 'A' || c > 'Z' || is_word_cont(cur_peek_at(p, 1))) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "argument variable expected");
+            return;
+        }
+        if (argc >= TIKU_BASIC_DEFN_ARGS) {
+            basic_throw(TIKU_BASIC_ERR_NOMEM, "too many DEF FN args");
+            return;
+        }
+        args[argc++] = (uint8_t)(c - 'A');
+        cur_advance(p);
+        skip_ws(p);
+        if (cur_peek(p) == ',') { cur_advance(p); continue; }
+        break;
+    }
+    if (cur_peek(p) != ')') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "')' expected"); return;
+    }
+    cur_advance(p);
+    skip_ws(p);
+    if (cur_peek(p) != '=') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "'=' expected"); return;
+    }
+    cur_advance(p);
+    skip_ws(p);
+
+    for (i = 0; i < TIKU_BASIC_DEFN_MAX; i++) {
+        if (basic_defns[i].name[0] == '\0') {
+            if (slot < 0) slot = i;
+        } else if (strncmp(basic_defns[i].name, nm,
+                           sizeof(basic_defns[i].name)) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "DEF FN table full");
+        return;
+    }
+    blen = 0;
+    while (cur_peek(p) != '\0' && cur_peek(p) != ':' &&
+           blen + 1u < sizeof(basic_defns[slot].body)) {
+        basic_defns[slot].body[blen++] = cur_peek(p);
+        cur_advance(p);
+    }
+    if (cur_peek(p) != '\0' && cur_peek(p) != ':') {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "DEF body too long");
+        return;
+    }
+    while (blen > 0 &&
+           (basic_defns[slot].body[blen-1] == ' ' ||
+            basic_defns[slot].body[blen-1] == '\t')) {
+        blen--;
+    }
+    basic_defns[slot].body[blen] = '\0';
+    strncpy(basic_defns[slot].name, nm, sizeof(basic_defns[slot].name));
+    basic_defns[slot].name[sizeof(basic_defns[slot].name) - 1] = '\0';
+    basic_defns[slot].arg_count = argc;
+    for (i = 0; i < (int)argc; i++) basic_defns[slot].arg_idx[i] = args[i];
+}
+#endif
+
+/* Find the prog index of the matching WEND for a WHILE that begins
+ * at @p start_line. Walks forward in line-number order, tracking
+ * nesting depth (WHILE++ / WEND--) so nested loops resolve correctly.
+ * Returns the index, or -1 if no matching WEND is found. */
+static int
+find_matching_wend(uint16_t start_line)
+{
+    int depth = 1;
+    int idx = prog_next_index((uint16_t)(start_line + 1));
+    while (idx >= 0) {
+        const char *t = prog[idx].text;
+        skip_ws(&t);
+        if (match_kw(&t, "WHILE")) depth++;
+        else if (match_kw(&t, "WEND")) {
+            depth--;
+            if (depth == 0) return idx;
+        }
+        if (prog[idx].number == 0xFFFFu) break;
+        idx = prog_next_index((uint16_t)(prog[idx].number + 1));
+    }
+    return -1;
+}
+
+/* WHILE expr  -- enter a condition-tested loop. If @p expr is true,
+ * push a frame whose back_line is the WHILE line itself (so the
+ * condition is re-evaluated on each WEND), and fall through to the
+ * body. If false, scan forward to the matching WEND and jump past
+ * it without pushing a frame. */
+static void
+exec_while(const char **p)
+{
+    long cond;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "WHILE outside RUN");
+        return;
+    }
+    cond = parse_cond(p);
+    if (basic_error) return;
+    if (cond == 0) {
+        int idx = find_matching_wend(basic_pc);
+        if (idx < 0) {
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "WHILE without WEND");
+            return;
+        }
+        /* Jump to the line AFTER WEND. */
+        {
+            int next = prog_next_index(
+                (uint16_t)(prog[idx].number + 1));
+            if (next < 0) {
+                /* WEND was the last line -- end the run. */
+                basic_running = 0;
+                basic_pc = 0;
+                return;
+            }
+            basic_pc = prog[next].number;
+            basic_pc_set = 1;
+        }
+        return;
+    }
+    if (loop_sp >= TIKU_BASIC_LOOP_DEPTH) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "loop stack overflow");
+        return;
+    }
+    loop_stack[loop_sp].back_line = basic_pc;
+    loop_sp++;
+}
+
+/* WEND  -- pop one loop frame and jump back to the WHILE line, which
+ * will re-evaluate the condition. The frame is popped so the WHILE
+ * can re-push it on entry; this avoids any state confusion if the
+ * WEND is reached from within a different control flow than expected. */
+static void
+exec_wend(const char **p)
+{
+    (void)p;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "WEND outside RUN");
+        return;
+    }
+    if (loop_sp == 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "WEND without WHILE");
+        return;
+    }
+    basic_pc     = loop_stack[loop_sp - 1].back_line;
+    basic_pc_set = 1;
+    loop_sp--;
+}
+
+/* REPEAT  -- mark the top of a post-tested loop. The body lines
+ * follow on subsequent program lines; UNTIL pops or loops back here. */
+static void
+exec_repeat(const char **p)
+{
+    (void)p;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "REPEAT outside RUN");
+        return;
+    }
+    if (loop_sp >= TIKU_BASIC_LOOP_DEPTH) {
+        basic_throw(TIKU_BASIC_ERR_NOMEM, "loop stack overflow");
+        return;
+    }
+    /* back_line = REPEAT line itself; the loop runs starting at the
+     * line AFTER it, which line_after() resolves cleanly. */
+    loop_stack[loop_sp].back_line = basic_pc;
+    loop_sp++;
+}
+
+/* UNTIL expr  -- if expr is false (loop NOT yet done), jump back to
+ * the line after REPEAT. If true, pop the frame and fall through. */
+static void
+exec_until(const char **p)
+{
+    long cond;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "UNTIL outside RUN");
+        return;
+    }
+    if (loop_sp == 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "UNTIL without REPEAT");
+        return;
+    }
+    cond = parse_cond(p);
+    if (basic_error) return;
+    if (cond == 0) {
+        uint16_t r = line_after(loop_stack[loop_sp - 1].back_line);
+        if (r == 0u) {
+            /* REPEAT was the last line -- nothing to loop. Pop. */
+            loop_sp--;
+            return;
+        }
+        basic_pc     = r;
+        basic_pc_set = 1;
+    } else {
+        loop_sp--;
+    }
+}
+
+
+/**
+ * @brief SWAP a, b  -- exchange two scalar variables.
+ *
+ * Both operands must be the same type (numeric or both string).
+ * Multi-letter names work for either operand.  Atomic in the
+ * sense that nothing observes the partial state.
+ */
+static void
+exec_swap(const char **p)
+{
+    int idx1, idx2;
+    int is_str1 = 0, is_str2 = 0;
+
+    if (!parse_var_full(p, &idx1, &is_str1)) {
+        if (!basic_error) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+        }
+        return;
+    }
+    skip_ws(p);
+    if (cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "',' expected");
+        return;
+    }
+    cur_advance(p);
+    if (!parse_var_full(p, &idx2, &is_str2)) {
+        if (!basic_error) {
+            basic_throw(TIKU_BASIC_ERR_SYNTAX, "variable expected");
+        }
+        return;
+    }
+    if (is_str1 != is_str2) {
+        basic_throw(TIKU_BASIC_ERR_TYPE, "SWAP type mismatch");
+        return;
+    }
+#if TIKU_BASIC_STRVARS_ENABLE
+    if (is_str1) {
+        char *tmp = basic_strvars[idx1];
+        basic_strvars[idx1] = basic_strvars[idx2];
+        basic_strvars[idx2] = tmp;
+        return;
+    }
+#endif
+    {
+        long tmp = basic_vars[idx1];
+        basic_vars[idx1] = basic_vars[idx2];
+        basic_vars[idx2] = tmp;
+    }
+}
+
+/**
+ * @brief PRINT USING -- formatted output.
+ *
+ * `#` is a digit position, right-aligned and space-padded: a run of N consumes
+ * one numeric argument and renders as `*` on overflow.  `&` is a whole-string
+ * field, no truncation or padding.  Anything else is emitted literally.
+ *
+ * @note A negative number spends one digit position on the leading '-'.
+ *       Arguments after the format are separated by `,` or `;` and fill
+ *       left-to-right; a format with no `#` and no `&` prints literally.
+ */
+static void
+exec_print_using(const char **p)
+{
+    char fmt[32];
+    int  flen = 0;
+    int  i;
+
+    skip_ws(p);
+    if (cur_peek(p) != '"') {
+        basic_throw(TIKU_BASIC_ERR_TYPE, "format string expected");
+        return;
+    }
+    cur_advance(p);
+    while (cur_peek(p) && cur_peek(p) != '"' && (size_t)flen + 1u < sizeof(fmt)) {
+        fmt[flen++] = cur_peek(p);
+        cur_advance(p);
+    }
+    fmt[flen] = '\0';
+    if (cur_peek(p) == '"') cur_advance(p);
+    skip_ws(p);
+    if (cur_peek(p) != ';' && cur_peek(p) != ',') {
+        basic_throw(TIKU_BASIC_ERR_SYNTAX, "';' expected");
+        return;
+    }
+    cur_advance(p);
+
+    /* Walk the format left-to-right.  Two kinds of placeholder:
+     *
+     *   `#...#` is a numeric field; the run of `#`s defines the
+     *   width and embedded `.` / `,` are kept as literal characters
+     *   within the field (so `##.##` is one numeric field with a
+     *   decimal point, not a width-2 field followed by a width-2
+     *   field).  Consumes one numeric argument; overflow renders
+     *   the digit positions as `*`.
+     *
+     *   `&` is a string field; the whole string argument is emitted
+     *   verbatim (no padding, no truncation).  Consumes one string
+     *   argument.
+     *
+     * Any other character outside a `#` run is emitted literally.
+     */
+    i = 0;
+    while (i < flen) {
+        if (fmt[i] == '#') {
+            /* Find end of this numeric field.  `.` and `,` inside
+             * the run stay part of the field (literal characters
+             * within it) so a separate digit_count is kept for the
+             * `#` slots only. */
+            int  start = i;
+            int  end;
+            int  digit_count = 0;
+            char digits[16];
+            long v;
+            int  dpos = 0;
+            int  neg = 0;
+            int  pad;
+            int  j;
+            end = i;
+            while (end < flen &&
+                   (fmt[end] == '#' || fmt[end] == '.' ||
+                    fmt[end] == ',')) {
+                if (fmt[end] == '#') digit_count++;
+                end++;
+            }
+            v = parse_expr(p);
+            if (basic_error) return;
+            if (v < 0) { neg = 1; v = -v; }
+            {
+                int n = snprintf(digits, sizeof(digits), "%ld", v);
+                int needed = (neg ? n + 1 : n);
+                if (needed > digit_count) {
+                    for (j = start; j < end; j++) {
+                        char e[2];
+                        e[0] = (fmt[j] == '#') ? '*' : fmt[j];
+                        e[1] = '\0';
+                        SHELL_PRINTF("%s", e);
+                    }
+                    i = end;
+                    goto sep_using;
+                }
+                pad = digit_count - needed;
+            }
+            for (j = start; j < end; j++) {
+                char e[2]; e[1] = '\0';
+                if (fmt[j] != '#') {
+                    e[0] = fmt[j];
+                } else if (pad > 0) {
+                    e[0] = ' '; pad--;
+                } else if (neg) {
+                    e[0] = '-'; neg = 0;
+                } else {
+                    e[0] = digits[dpos++];
+                }
+                SHELL_PRINTF("%s", e);
+            }
+            i = end;
+            goto sep_using;
+        }
+        if (fmt[i] == '&') {
+#if TIKU_BASIC_STRVARS_ENABLE
+            char buf[TIKU_BASIC_STR_BUF_CAP];
+            if (!peek_string_expr(*p)) {
+                basic_throw(TIKU_BASIC_ERR_TYPE, "string expected");
+                return;
+            }
+            if (parse_strexpr(p, buf, sizeof(buf)) != 0) return;
+            SHELL_PRINTF("%s", buf);
+#else
+            basic_throw(TIKU_BASIC_ERR_GENERAL, "& needs string support");
+            return;
+#endif
+            i++;
+            goto sep_using;
+        }
+        /* Literal character. */
+        {
+            char e[2]; e[0] = fmt[i]; e[1] = '\0';
+            SHELL_PRINTF("%s", e);
+        }
+        i++;
+        continue;
+
+sep_using:
+        skip_ws(p);
+        if (cur_peek(p) == ',' || cur_peek(p) == ';') {
+            cur_advance(p);
+            skip_ws(p);
+        }
+    }
+    SHELL_PRINTF("\n");
+}

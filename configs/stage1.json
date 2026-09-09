@@ -1,0 +1,37 @@
+{
+  "primary_endpoint": "delivered_downstream_utility / (cpu_cycles + controller_cycles)",
+  "budget_cycles": 2400,
+  "seeds": 24,
+  "policies": [
+    "rr",
+    "cost",
+    "spt",
+    "edf",
+    "llf",
+    "quality",
+    "task",
+    "max_utility",
+    "utility_density",
+    "clairvoyant_dp"
+  ],
+  "regimes": [
+    "homogeneous",
+    "independent",
+    "high_uncertainty",
+    "tight_deadlines",
+    "misleading_quality",
+    "utility_cost_anticorrelation",
+    "nonstationary",
+    "adversarial",
+    "high_compute_cost",
+    "controller_cost_dominant",
+    "noisy_hint",
+    "delayed_hint",
+    "miscalibrated",
+    "rank_error",
+    "distribution_shift"
+  ],
+  "controller_cycles_per_decision": 35,
+  "artifact_version": "0.3.0",
+  "primary_comparison": "utility_density - rr"
+}

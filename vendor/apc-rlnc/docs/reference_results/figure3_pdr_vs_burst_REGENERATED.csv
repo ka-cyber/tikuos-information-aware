@@ -1,0 +1,7 @@
+scheme,burst_duration_packets,pdr_pct_mean,pdr_pct_std
+random,10,96.67,4.71
+random,30,76.67,17.0
+random,50,53.33,9.43
+apc,10,96.67,4.71
+apc,30,93.33,4.71
+apc,50,93.33,4.71

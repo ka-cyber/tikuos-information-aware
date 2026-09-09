@@ -1,0 +1,249 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_basic_select.inl - SELECT CASE, CASE and END SELECT helpers.
+ *
+ * Evaluates the controlling expression once, scans forward for the first matching
+ * arm and jumps past it; reaching another CASE during normal flow means the arm
+ * finished.  Nesting works through depth-aware scanning.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/*---------------------------------------------------------------------------*/
+/* LINE-SHAPE PREDICATES                                                     */
+/*---------------------------------------------------------------------------*/
+
+/** @brief Does @p t (line text) start with `SELECT CASE`? */
+static int
+line_is_select_case(const char *t)
+{
+    skip_ws(&t);
+    if (!match_kw(&t, "SELECT")) return 0;
+    return match_kw(&t, "CASE") ? 1 : 0;
+}
+
+/** @brief Does @p t (line text) start with `CASE` (any flavour)? */
+static int
+line_is_case(const char *t)
+{
+    skip_ws(&t);
+    return match_kw(&t, "CASE") ? 1 : 0;
+}
+
+/** @brief Does @p t (line text) start with `END SELECT`? */
+static int
+line_is_end_select(const char *t)
+{
+    skip_ws(&t);
+    if (!match_kw(&t, "END")) return 0;
+    skip_ws(&t);
+    return match_kw(&t, "SELECT") ? 1 : 0;
+}
+
+/*---------------------------------------------------------------------------*/
+/* CASE-ARM MATCHING                                                         */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Test whether @p value matches the patterns on a CASE line.
+ *
+ * @p t points just past the `CASE` keyword.  Patterns are
+ * comma-separated, where each pattern is either:
+ *   - `expr`              -- value == expr
+ *   - `lo TO hi`          -- value >= lo and value <= hi
+ *
+ * The literal `CASE ELSE` is not parsed here; callers detect it via
+ * a leading `ELSE` keyword and treat it as a catch-all.
+ *
+ * @return 1 if any pattern matches, 0 otherwise.  basic_error is
+ *         set on parser failure (caller should treat as fatal).
+ */
+static int
+case_arm_matches(const char *t, long value)
+{
+    while (1) {
+        long lo;
+        skip_ws(&t);
+        if (*t == '\0' || *t == ':') return 0;
+        lo = parse_expr(&t);
+        if (basic_error) return 0;
+        skip_ws(&t);
+        if (match_kw(&t, "TO")) {
+            long hi = parse_expr(&t);
+            if (basic_error) return 0;
+            if (value >= lo && value <= hi) return 1;
+        } else {
+            if (value == lo) return 1;
+        }
+        skip_ws(&t);
+        if (*t == ',') { t++; continue; }
+        return 0;
+    }
+}
+
+/*---------------------------------------------------------------------------*/
+/* DISPATCH SCANNERS                                                         */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief Find the prog[] index of the matching arm for SELECT CASE
+ *        starting at @p select_line.
+ *
+ * Walks forward in line-number order tracking nested SELECT CASE depth, and
+ * returns the first CASE arm whose pattern matches @p value, else the CASE ELSE
+ * arm, else the END SELECT line.
+ *
+ * @return prog index, or -1 if no END SELECT found.
+ */
+static int
+find_select_arm(uint16_t select_line, long value)
+{
+    int depth    = 0;
+    int else_idx = -1;
+    int end_idx  = -1;
+    int idx      = prog_next_index((uint16_t)(select_line + 1));
+    while (idx >= 0) {
+        const char *t = prog[idx].text;
+        if (line_is_select_case(t)) {
+            depth++;
+        } else if (line_is_end_select(t)) {
+            if (depth == 0) {
+                end_idx = idx;
+                break;
+            }
+            depth--;
+        } else if (depth == 0 && line_is_case(t)) {
+            const char *u = t;
+            skip_ws(&u);
+            (void)match_kw(&u, "CASE");
+            skip_ws(&u);
+            if (match_kw(&u, "ELSE")) {
+                if (else_idx < 0) else_idx = idx;
+            } else {
+                if (case_arm_matches(u, value)) {
+                    return idx;
+                }
+                if (basic_error) return -1;
+            }
+        }
+        if (prog[idx].number == 0xFFFFu) break;
+        idx = prog_next_index((uint16_t)(prog[idx].number + 1));
+    }
+    if (else_idx >= 0) return else_idx;
+    return end_idx;
+}
+
+/**
+ * @brief Find the prog[] index of the END SELECT matching the
+ *        (open) SELECT CASE that contains @p start_line.
+ *
+ * Used when execution reaches a CASE / CASE ELSE during normal
+ * flow (= "previous arm just finished"); the jump goes past END SELECT.
+ *
+ * @return prog index of END SELECT, or -1 if not found.
+ */
+static int
+find_matching_end_select(uint16_t start_line)
+{
+    int depth = 0;
+    int idx   = prog_next_index((uint16_t)(start_line + 1));
+    while (idx >= 0) {
+        const char *t = prog[idx].text;
+        if (line_is_select_case(t)) {
+            depth++;
+        } else if (line_is_end_select(t)) {
+            if (depth == 0) return idx;
+            depth--;
+        }
+        if (prog[idx].number == 0xFFFFu) break;
+        idx = prog_next_index((uint16_t)(prog[idx].number + 1));
+    }
+    return -1;
+}
+
+/*---------------------------------------------------------------------------*/
+/* STATEMENT EXECUTORS                                                       */
+/*---------------------------------------------------------------------------*/
+
+/**
+ * @brief SELECT CASE expr  -- evaluate, jump to the matching arm.
+ *
+ * After dispatching, basic_pc points at the line immediately after
+ * the matched CASE / CASE ELSE / END SELECT.
+ */
+static void
+exec_select_case(const char **p)
+{
+    long value;
+    int  idx;
+
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "SELECT CASE outside RUN");
+        return;
+    }
+    value = parse_expr(p);
+    if (basic_error) return;
+    idx = find_select_arm(basic_pc, value);
+    if (idx < 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "SELECT without END SELECT");
+        return;
+    }
+    /* Jump to the line AFTER the arm header (or after END SELECT
+     * if no arm matched). */
+    {
+        int next = prog_next_index((uint16_t)(prog[idx].number + 1));
+        if (next < 0) {
+            basic_running = 0;
+            basic_pc      = 0;
+        } else {
+            basic_pc     = prog[next].number;
+            basic_pc_set = 1;
+        }
+    }
+    while (cur_peek(p)) cur_advance(p);
+}
+
+/**
+ * @brief CASE encountered as a statement during normal flow.
+ *
+ * Means the previous arm has just finished and control is about to
+ * start the next arm by accident; jump past the matching END
+ * SELECT so only the dispatched arm runs.
+ */
+static void
+exec_case(const char **p)
+{
+    int idx;
+    if (!basic_running) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "CASE outside RUN");
+        return;
+    }
+    idx = find_matching_end_select(basic_pc);
+    if (idx < 0) {
+        basic_throw(TIKU_BASIC_ERR_GENERAL, "CASE without END SELECT");
+        return;
+    }
+    {
+        int next = prog_next_index((uint16_t)(prog[idx].number + 1));
+        if (next < 0) {
+            basic_running = 0;
+            basic_pc      = 0;
+        } else {
+            basic_pc     = prog[next].number;
+            basic_pc_set = 1;
+        }
+    }
+    while (cur_peek(p)) cur_advance(p);
+}
+
+/** @brief END SELECT marker: no-op when reached during execution. */
+static void
+exec_end_select(const char **p)
+{
+    while (cur_peek(p)) cur_advance(p);
+}

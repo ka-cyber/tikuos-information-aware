@@ -1,0 +1,201 @@
+{
+  "primary_endpoint": "utility_per_cycle",
+  "comparison": "utility_density - rr",
+  "regimes": {
+    "homogeneous": {
+      "n": 24,
+      "mean_difference": 0.00037840160932870533,
+      "ci95": [
+        0.0002742871544068963,
+        0.0004782823612492254
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 5.960464477539062e-07,
+      "cohens_dz": 1.4655830937829715,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "independent": {
+      "n": 24,
+      "mean_difference": 0.0011351911871175253,
+      "ci95": [
+        0.0009432283200896132,
+        0.0013187631873179248
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.1920928955078125e-07,
+      "cohens_dz": 2.3641044511079,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "high_uncertainty": {
+      "n": 24,
+      "mean_difference": 0.00038033932823650416,
+      "ci95": [
+        0.00029707389323016856,
+        0.000465527023129778
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 5.960464477539062e-07,
+      "cohens_dz": 1.7495570034306125,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "tight_deadlines": {
+      "n": 24,
+      "mean_difference": 0.0002027689282995503,
+      "ci95": [
+        0.00011567069445142546,
+        0.0002831262368522409
+      ],
+      "permutation_p": 0.00034998250087495624,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 9.083747863769531e-05,
+      "cohens_dz": 0.9484078128492621,
+      "holm_adjusted_permutation_p": 0.0010499475026248687
+    },
+    "misleading_quality": {
+      "n": 24,
+      "mean_difference": 0.000827509043621511,
+      "ci95": [
+        0.0006685759210444502,
+        0.0009749559948479992
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 3.5762786865234375e-07,
+      "cohens_dz": 2.103052215408578,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "utility_cost_anticorrelation": {
+      "n": 24,
+      "mean_difference": 0.001594237558597116,
+      "ci95": [
+        0.0014136317996238687,
+        0.0017622476966070652
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.1920928955078125e-07,
+      "cohens_dz": 3.5277119384779407,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "nonstationary": {
+      "n": 24,
+      "mean_difference": 0.0019043446844742272,
+      "ci95": [
+        0.00174484159536353,
+        0.0020578640057324605
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.1920928955078125e-07,
+      "cohens_dz": 4.790517855472622,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "adversarial": {
+      "n": 24,
+      "mean_difference": -0.00038307665702820874,
+      "ci95": [
+        -0.0005781642213571544,
+        -0.00019390983710148834
+      ],
+      "permutation_p": 0.0007499625018749063,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 0.001092672348022461,
+      "cohens_dz": -0.7704074343012368,
+      "holm_adjusted_permutation_p": 0.0014999250037498126
+    },
+    "high_compute_cost": {
+      "n": 24,
+      "mean_difference": 0.0002334334277556235,
+      "ci95": [
+        0.00015200954691342922,
+        0.00031233194741461605
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 2.467632293701172e-05,
+      "cohens_dz": 1.1428160799603497,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "controller_cost_dominant": {
+      "n": 24,
+      "mean_difference": -0.05660292841230164,
+      "ci95": [
+        -0.058235912824271166,
+        -0.054875400345914434
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.1920928955078125e-07,
+      "cohens_dz": -13.167161946265871,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "noisy_hint": {
+      "n": 24,
+      "mean_difference": 0.0006137884724570154,
+      "ci95": [
+        0.00043452078253068314,
+        0.0007843805300604547
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 8.344650268554688e-06,
+      "cohens_dz": 1.3703068684632065,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "delayed_hint": {
+      "n": 24,
+      "mean_difference": 0.00023235101078087286,
+      "ci95": [
+        3.37937053651224e-05,
+        0.0004287594626360701
+      ],
+      "permutation_p": 0.0335983200839958,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 0.026927709579467773,
+      "cohens_dz": 0.46108054479546295,
+      "holm_adjusted_permutation_p": 0.0335983200839958
+    },
+    "miscalibrated": {
+      "n": 24,
+      "mean_difference": 0.0006353362314070739,
+      "ci95": [
+        0.00047165873421631976,
+        0.0008005145004485399
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.1920928955078125e-06,
+      "cohens_dz": 1.4981065415555828,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "rank_error": {
+      "n": 24,
+      "mean_difference": 0.0007000801539157331,
+      "ci95": [
+        0.0004914673013371839,
+        0.0009144997988784495
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 6.556510925292969e-06,
+      "cohens_dz": 1.294877345053306,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    },
+    "distribution_shift": {
+      "n": 24,
+      "mean_difference": 0.0006249546586767498,
+      "ci95": [
+        0.00042733352889503395,
+        0.0008294811417069622
+      ],
+      "permutation_p": 4.999750012499375e-05,
+      "permutation_mode": "monte_carlo",
+      "wilcoxon_p": 1.3113021850585938e-05,
+      "cohens_dz": 1.2045013042124684,
+      "holm_adjusted_permutation_p": 0.0007499625018749063
+    }
+  }
+}

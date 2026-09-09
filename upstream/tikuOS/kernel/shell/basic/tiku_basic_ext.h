@@ -1,0 +1,107 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_basic_ext.h - native builtin registry for Tiku BASIC.
+ *
+ * Lets kernel services register new words at boot without editing the interpreter:
+ * statements dispatch after the built-in keyword chain, functions after the
+ * built-in function chain.  Registered names are never crunched, so builtins win.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_BASIC_EXT_H_
+#define TIKU_BASIC_EXT_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+/** Longest registered name incl. NUL. */
+#define TIKU_BASIC_EXT_NAME_MAX 12
+
+/**
+ * @brief Statement handler.
+ *
+ * The cursor sits just past the keyword, trailing whitespace consumed.  Parse
+ * arguments with the services below and raise errors via
+ * tiku_basic_ext_error().
+ *
+ * @note On return the interpreter treats remaining unconsumed text like any
+ *       statement tail: ':' continues, junk errors.
+ */
+typedef void (*tiku_basic_ext_stmt_fn)(const char **p);
+
+/**
+ * @brief Numeric function handler.
+ *
+ * The interpreter parses `(a[, b])` per the registered arity and passes the
+ * evaluated values; argc is the arity.  Return 0 with *out set, or nonzero
+ * after raising an error via tiku_basic_ext_error().
+ */
+typedef int (*tiku_basic_ext_nfn)(const long *args, int argc, long *out);
+
+/**
+ * @brief String-returning function handler (`NAME$`).
+ *
+ * Unlike numeric functions the handler PARSES ITS OWN arguments, so it can take
+ * string args, numeric args or a mix; on entry the cursor sits just past the
+ * name.  Write the result into @p out (capacity @p cap, always NUL-terminated).
+ *
+ * @note Use tiku_basic_ext_expect() for '(' / ',' / ')' and
+ *       tiku_basic_ext_parse_expr / _parse_strexpr for the arguments; raise
+ *       errors via tiku_basic_ext_error().
+ */
+typedef void (*tiku_basic_ext_strfn)(const char **p, char *out, size_t cap);
+
+/**
+ * @brief Register a statement word.
+ * @return 0 on success; -1 on invalid name / keyword collision / table full.
+ */
+int tiku_basic_register_stmt(const char *name, tiku_basic_ext_stmt_fn fn);
+
+/**
+ * @brief Register a numeric function word with fixed arity 0..2.
+ * @return 0 on success; -1 on invalid name / arity / collision / table full.
+ */
+int tiku_basic_register_fn(const char *name, uint8_t arity,
+                           tiku_basic_ext_nfn fn);
+
+/**
+ * @brief Register a string-returning function word.  @p name MUST end in '$'.
+ *        The handler parses its own args (see tiku_basic_ext_strfn).
+ * @return 0 on success; -1 on invalid name / collision / table full, or when
+ *         the build has string support disabled.
+ */
+int tiku_basic_register_strfn(const char *name, tiku_basic_ext_strfn fn);
+
+/*---------------------------------------------------------------------------*/
+/* Parser / error services for statement handlers.                           */
+/* This is the minimal stable surface extensions may touch (and the ABI a    */
+/* future native-module loader would program against -- see loadable.md).    */
+/*---------------------------------------------------------------------------*/
+
+/** Evaluate a numeric expression at the cursor. 0 on success, -1 on error. */
+int tiku_basic_ext_parse_expr(const char **p, long *out);
+
+/** Evaluate a string expression into buf. 0 on success, -1 on error (also
+ *  -1 when the build has string support disabled). */
+int tiku_basic_ext_parse_strexpr(const char **p, char *buf, size_t cap);
+
+/** Raise an interpreter error (cat = TIKU_BASIC_ERR_*, msg = bare text).
+ *  Routes through the A5 sink, so it works headless. */
+void tiku_basic_ext_error(int cat, const char *msg);
+
+/** Write @p s to the BASIC console (no newline added).  The output surface a
+ *  statement extension needs -- same stream PRINT uses. */
+void tiku_basic_ext_print(const char *s);
+
+/** Skip whitespace, then require and consume @p ch (e.g. '(' ',' ')').
+ *  0 on success; -1 after raising a syntax error.  The punctuation helper a
+ *  self-parsing statement / string handler needs. */
+int tiku_basic_ext_expect(const char **p, char ch);
+
+#endif /* TIKU_BASIC_EXT_H_ */

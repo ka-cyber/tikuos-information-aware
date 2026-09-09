@@ -1,0 +1,57 @@
+# Runs apc-cluster-daemon on every edge node (e.g. each of the 10 Jetson
+# Nano testbed devices, Section 6.2), with host networking so it can bind
+# directly to the wireless interface (wlan0) for gossip broadcasts.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: apc-clustering-daemon
+  namespace: apc-rlnc
+  labels:
+    app: apc-clustering-daemon
+spec:
+  selector:
+    matchLabels:
+      app: apc-clustering-daemon
+  template:
+    metadata:
+      labels:
+        app: apc-clustering-daemon
+    spec:
+      hostNetwork: true  # required: UDP gossip broadcast needs the real L2/L3 interface
+      nodeSelector:
+        apc-rlnc/role: edge-node
+      containers:
+        - name: clustering-daemon
+          image: apc-rlnc/clustering-go:latest  # build from testbed/clustering-go/Dockerfile
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--interface=$(WIRELESS_INTERFACE)"
+            - "--epoch-duration=$(EPOCH_DURATION)"
+            - "--alpha=$(EWMA_ALPHA)"
+            - "--lambda=$(CLUSTERING_LAMBDA)"
+            - "--gossip-rounds=$(GOSSIP_ROUNDS)"
+          env:
+            - name: WIRELESS_INTERFACE
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: WIRELESS_INTERFACE}}
+            - name: EPOCH_DURATION
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: EPOCH_DURATION}}
+            - name: EWMA_ALPHA
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: EWMA_ALPHA}}
+            - name: CLUSTERING_LAMBDA
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: CLUSTERING_LAMBDA}}
+            - name: GOSSIP_ROUNDS
+              valueFrom: {configMapKeyRef: {name: apc-rlnc-config, key: GOSSIP_ROUNDS}}
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"   # matches the paper's <8% CPU load target on a Cortex-A57 core
+              memory: "64Mi"
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]  # needed for the netem sidecar / raw sockets
+      tolerations:
+        - key: "apc-rlnc/edge"
+          operator: "Exists"
+          effect: "NoSchedule"

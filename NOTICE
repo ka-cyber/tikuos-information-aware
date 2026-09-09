@@ -1,0 +1,8 @@
+# Third-party provenance
+
+- `upstream/tikuOS/` is the supplied TikuOS source snapshot and retains its Apache-2.0 license.
+- `vendor/cardiofusion/` contains selected supplied CardioFusion-AI source and retains its MIT license.
+- `vendor/apc-rlnc/` contains selected supplied APC-RLNC source and retains its MIT license.
+- `vendor/pir/` contains selected supplied PIR-Framework material. The supplied project declares MIT in `pyproject.toml`.
+
+No third-party license or copyright notice has been removed.

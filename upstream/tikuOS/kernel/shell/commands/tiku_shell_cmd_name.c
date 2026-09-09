@@ -1,0 +1,47 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_shell_cmd_name.c - "name" command implementation.
+ *
+ * Reads or sets /sys/device/name.  The underlying node is NVM-backed, so a change
+ * persists across reset and power loss.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "tiku_shell_cmd_name.h"
+#include <kernel/shell/tiku_shell.h>
+#include <kernel/vfs/tiku_vfs.h>
+#include <string.h>
+
+#define DEVICE_NAME_PATH "/sys/device/name"
+
+void
+tiku_shell_cmd_name(uint8_t argc, const char *argv[])
+{
+    char buf[40];
+    int n;
+
+    if (argc < 2) {
+        n = tiku_vfs_read(DEVICE_NAME_PATH, buf, sizeof(buf) - 1);
+        if (n < 0) {
+            SHELL_PRINTF("name: read failed\n");
+            return;
+        }
+        buf[n] = '\0';
+        SHELL_PRINTF("%s", buf);
+        return;
+    }
+
+    if (tiku_vfs_write(DEVICE_NAME_PATH, argv[1],
+                       (uint8_t)strlen(argv[1])) < 0) {
+        SHELL_PRINTF("name: invalid value\n");
+        return;
+    }
+
+    SHELL_PRINTF("name set to '%s'\n", argv[1]);
+}

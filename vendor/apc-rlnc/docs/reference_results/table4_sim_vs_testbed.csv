@@ -1,0 +1,5 @@
+metric,simulation,testbed_mean,testbed_std,error_pct
+PDR (%),97.82,96.91,1.2,0.93
+Latency (ms),142,156,18,9.86
+Throughput (Mbps),1.24,1.18,0.15,4.84
+CPU util. (%),7.2,7.8,1.1,8.33

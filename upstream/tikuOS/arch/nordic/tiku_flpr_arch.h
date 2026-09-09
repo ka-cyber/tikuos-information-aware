@@ -1,0 +1,307 @@
+/*
+ * Tiku Operating System v0.06
+ * Simple. Ubiquitous. Intelligence, Everywhere.
+ * http://tiku-os.org
+ *
+ * Authors: Ambuj Varshney <ambuj@tiku-os.org>
+ *
+ * tiku_flpr_arch.h - nRF54L FLPR (VPR RISC-V) coprocessor control.
+ *
+ * App-core side: load the embedded image into the SRAM carve, start and stop the
+ * core, and read the liveness state the firmware publishes through the shared
+ * page.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef TIKU_NORDIC_FLPR_ARCH_H_
+#define TIKU_NORDIC_FLPR_ARCH_H_
+
+#include <stdint.h>
+
+/**
+ * @brief Copy the embedded FLPR image into the carve and start the core.
+ *
+ * Idempotent: restarting reloads the image (fresh .data/.bss world) and
+ * re-arms INITPC before CPURUN.
+ *
+ * @return 0 on success, negative if the embedded image is missing/oversized.
+ */
+int tiku_flpr_arch_start(void);
+
+/** @brief Stop the coprocessor (CPURUN=Stopped). Idempotent. */
+void tiku_flpr_arch_stop(void);
+
+/** @brief 1 when CPURUN reads Running. */
+int tiku_flpr_arch_running(void);
+
+/** @brief The payload's boot/fault magic, raw; 0 before the first launch. */
+uint32_t tiku_flpr_arch_magic(void);
+
+/** @brief 1 when the firmware has stamped its magic (reached main()). */
+int tiku_flpr_arch_alive(void);
+
+/** @brief Current heartbeat counter from the shared page. */
+uint32_t tiku_flpr_arch_heartbeat(void);
+
+/** @brief Embedded image size in bytes (0 if the build carries none). */
+uint32_t tiku_flpr_arch_image_size(void);
+
+/**
+ * @brief Send one message (<= TIKU_FLPR_MSG_CAP bytes) to the firmware.
+ * @return 0 on success, negative when not running / oversized.
+ */
+int tiku_flpr_arch_send(const void *data, uint32_t len);
+
+/** @brief Pull any pending flpr->app message (doorbell fallback). */
+void tiku_flpr_arch_poll(void);
+
+/** @brief Count of flpr->app messages captured (ISR or pull). */
+uint32_t tiku_flpr_arch_reply_seq(void);
+
+/** @brief Copy the most recent reply into @p out; returns its length. */
+uint32_t tiku_flpr_arch_reply(void *out, uint32_t cap);
+
+/**
+ * @brief Command a waveform from the pulse engine and verify it.
+ *
+ * Blocks while the firmware emits @p edges transitions at 50%% duty with
+ * @p period_us microsecond period on P2.07 (LED3), sampling the same pad
+ * from this core the whole time.
+ *
+ * @param measured  Out: transitions observed by this core's sampler.
+ * @param ms        Out: wall-clock milliseconds the pattern took (pace
+ *                  calibration: expected = period_us * edges / 2000).
+ * @return 0 done, -1 bad args / not running, -2 firmware never finished.
+ */
+int tiku_flpr_arch_pulse(uint32_t period_us, uint32_t edges,
+                         uint32_t *measured, uint32_t *ms);
+
+/**
+ * @brief Start a compute-only load on the coprocessor (non-blocking).
+ *
+ * Returns as soon as the command is posted, so the caller can sleep while the
+ * coprocessor works -- the "offloaded work, host asleep" state a blocking call
+ * could never produce.
+ *
+ * @note Drives no pin, unlike the pulse engine (which owns DK LED3, whose
+ *       current would dominate any power measurement), and does not touch the
+ *       radio, unlike the beacon path.
+ * @param iters Outer passes; each is 4096 register-only inner iterations.
+ * @return 0 if handed over, -1 if the coprocessor is not running.
+ */
+int tiku_flpr_arch_spin_start(uint32_t iters);
+
+/** @brief Outer passes the coprocessor has retired so far (the WORK done). */
+uint32_t tiku_flpr_arch_spin_passes(void);
+
+/** @brief End a sustained compute load early (drops back to the mailbox loop). */
+void tiku_flpr_arch_spin_abort(void);
+
+/** @brief Non-zero once the coprocessor has finished the requested passes. */
+int tiku_flpr_arch_spin_done(void);
+
+/**
+ * @brief Run a fixed compute load and time it against the GRTC.
+ *
+ * Blocks.  A clock oracle: the coprocessor shares HCLK128M with the application
+ * core, so the same work must take half as long on a 128 MHz build as on a
+ * 64 MHz one, which is how the claim gets tested rather than assumed.
+ *
+ * @note The app core busy-polls while waiting, contending for the shared SRAM
+ *       and measurably slowing the coprocessor -- compare like with like, or
+ *       use the non-blocking form with the app core asleep.
+ * @return 0 on completion, -1 if not running, -2 if it never reported done.
+ */
+int tiku_flpr_arch_spin_timed(uint32_t iters, uint32_t *passes, uint32_t *us);
+
+/**
+ * @brief Offload duty-cycled BLE beaconing to the coprocessor.
+ *
+ * Caller contract: the radio link-config registers are already programmed by
+ * tiku_radio_arch_init and the session CONSTLAT hold is taken.  While
+ * offloaded the M33 must not touch RADIO or UARTE21, both flipped NonSecure.
+ *
+ * @param pdu          RAM-format PDU ([S0][LEN][S1][payload...]).
+ * @param len          Buffer bytes (<= 48).
+ * @param interval_ms  Burst interval.
+ * @return 0 on success, negative if not running / bad args.
+ */
+int tiku_flpr_arch_beacon(const uint8_t *pdu, uint32_t len,
+                          uint32_t interval_ms);
+
+/** @brief Stop the offloaded beacon and restore peripheral security. */
+void tiku_flpr_arch_beacon_stop(void);
+
+/** @brief Bursts transmitted by the coprocessor since beacon start. */
+uint32_t tiku_flpr_arch_beacon_bursts(void);
+
+/**
+ * @brief RX probe: prove the FLPR can drive RADIO RX.
+ *
+ * Same handoff as the beacon -- the caller programmed link config and holds
+ * CONSTLAT, and RADIO plus UARTE21 are flipped NonSecure here.  Blocks ~4-5 s
+ * listening on adv channel 37, then reports what it heard.
+ *
+ * @param addr_evts   Out: ADDRESS matches (AA matched, CRC unchecked).
+ * @param crcok_evts  Out: CRC-valid packets received.
+ * @param first       Out: head bytes of the first CRC-valid packet.
+ * @param cap         Capacity of @p first.
+ * @param flen        Out: bytes written to @p first.
+ * @return 0 done, -1 not running, -2 firmware never finished.
+ */
+int tiku_flpr_arch_rxprobe(uint32_t *addr_evts, uint32_t *crcok_evts,
+                           uint8_t *first, uint32_t cap, uint32_t *flen);
+
+/** Parsed CONNECT_IND the FLPR captured (L6 F-L6.1). */
+typedef struct {
+    uint32_t aa;            /**< data-channel access address        */
+    uint32_t crcinit;       /**< 24-bit CRC init                    */
+    uint16_t interval;      /**< connInterval, 1.25 ms units        */
+    uint16_t timeout;       /**< supervision timeout, 10 ms units   */
+    uint8_t  hop;           /**< hopIncrement                       */
+    uint8_t  winsize;       /**< transmitWindowSize units           */
+} tiku_flpr_conn_info_t;
+
+/**
+ * @brief FLPR advertises connectably and captures the CONNECT_IND (step 1a).
+ *
+ * Same NS handoff as the beacon (caller ran tiku_radio_arch_init + holds
+ * CONSTLAT).  Blocks until a central connects or the FLPR gives up (~8 s of
+ * advertising).  Restores peripheral security on return.
+ *
+ * @param adv      Connectable ADV PDU ([S0=0x40][LEN][S1][AdvA][AD...]).
+ * @param adv_len  Bytes in @p adv (<= 48).
+ * @param addr     AdvA to match in the CONNECT_IND (6 bytes).
+ * @param rsp      SCAN_RSP PDU answering a SCAN_REQ; 0 length leaves the
+ *                 controller mirroring the advert, which a scanner's
+ *                 duplicate filter may drop as a repeat.
+ * @param rsp_len  bytes in @p rsp.
+ * @param out      Filled with the parsed CONNECT_IND when connected.
+ * @return 0 connected (out filled), -1 not running / bad args, -2 gave up.
+ */
+int tiku_flpr_arch_conn_capture(const uint8_t *adv, uint32_t adv_len,
+                                const uint8_t *rsp, uint32_t rsp_len,
+                                const uint8_t *addr,
+                                tiku_flpr_conn_info_t *out);
+
+/** @brief 1 while the FLPR is holding a live connection (step 1b). */
+int tiku_flpr_arch_conn_active(void);
+
+/**
+ * @brief Advertising telemetry for the last (or running) advertise session.
+ *
+ * @param tx      ADV_IND PDUs transmitted.
+ * @param scanreq SCAN_REQs addressed to this advertiser.
+ * @param scanrsp SCAN_RSPs transmitted in reply.
+ * @param other   other CRC-good PDUs seen in the post-ADV window.
+ */
+void tiku_flpr_arch_adv_counts(uint32_t *tx, uint32_t *scanreq,
+                               uint32_t *scanrsp, uint32_t *other);
+
+/** @brief The last SCAN_RSP's access address, TIMER10 ticks (2 MHz) after
+ *         the request's end; a scanner's own request reads ~395 here. */
+uint32_t tiku_flpr_arch_adv_tifs(void);
+
+/** @brief TIMER10 ticks from a SCAN_REQ's end to the reply's TXEN, handed
+ *         to the controller at the next advertise; 0 = its own figure. */
+extern uint32_t tiku_flpr_arch_adv_txen_ticks;
+
+/** @brief Raw conn_state: 0 advertising, 1 connected, 2 gave up, 3 ended. */
+uint32_t tiku_flpr_arch_conn_state(void);
+
+/** @brief Connection events the FLPR has serviced (rising = link alive). */
+uint32_t tiku_flpr_arch_conn_events(void);
+
+/**
+ * @brief Phase E: peer + local address from the CONNECT_IND, for SMP f5/f6.
+ * @param inita out: initiator (central) address A (6 B, little-endian); or NULL.
+ * @param adva  out: advertiser (local) address B (6 B); or NULL.
+ * @return address-type bitfield: bit0 InitA, bit1 AdvA (1 = random public 0).
+ */
+uint8_t tiku_flpr_arch_conn_addrs(uint8_t inita[6], uint8_t adva[6]);
+
+/**
+ * @brief Service an LL_ENC_REQ forwarded by the FLPR.
+ *
+ * When the FLPR has published a fresh LL_ENC_REQ (SKDm/IVm), generates SKDs/IVs,
+ * derives the session key SK = e(LTK, SKDm||SKDs) and IV = IVm||IVs -- the FLPR
+ * has no AES -- publishes them, and releases the FLPR to send LL_ENC_RSP.
+ *
+ * @param ltk the pairing Long Term Key.
+ * @return 1 on the call that services a request (SK now readable), else 0.
+ */
+int tiku_flpr_arch_enc_service(const uint8_t ltk[16]);
+
+/** @brief Copy the derived session key (valid after enc_service() returned 1).*/
+void tiku_flpr_arch_enc_sk(uint8_t sk[16]);
+
+/** @brief Copy the session IV = IVm||IVs (valid after enc_service() == 1). */
+void tiku_flpr_arch_enc_iv(uint8_t iv[8]);
+
+/** @brief Phase F1: negotiated DLE max LL payload (0 until LL_LENGTH done). */
+uint32_t tiku_flpr_arch_dle_max(void);
+
+/** @brief Phase F2: current PHY (0 = 1M, 1 = 2M); @p at_evt = conn_events at the
+ *         switch (survival = current conn_events - at_evt). */
+uint32_t tiku_flpr_arch_conn_phy(uint32_t *at_evt);
+
+/** @brief F2 bisect telemetry: MODE readback at the switch + post-switch
+ *         ADDRESS/CRCOK counts.  Any pointer may be NULL. */
+void tiku_flpr_arch_conn_phy_diag(uint32_t *mode, uint32_t *addr,
+                                  uint32_t *crcok);
+
+/**
+ * @brief Phase A telemetry: LL updates applied this connection.
+ * @param chan_map  out: LL_CHANNEL_MAP_UPDATE_INDs followed to their Instant.
+ * @param conn_upd  out: LL_CONNECTION_UPDATE_INDs followed to their Instant.
+ * @return chan_map + conn_upd (total).  Both nonzero after a Phase A run
+ *         proves the FLPR follows a central's mid-connection reparametrise.
+ */
+uint32_t tiku_flpr_arch_conn_updates(uint32_t *chan_map, uint32_t *conn_upd);
+
+/** @brief Stop the FLPR's hold loop and reclaim the RADIO (secure). */
+void tiku_flpr_arch_conn_stop(void);
+
+/**
+ * @brief Anchored-RX telemetry (power): the FLPR holds the RADIO off for
+ *        the dead part of each interval, its length found by a closed-loop
+ *        creep against the measured RX-wait, then falls into the catch.
+ * @param gap_off_it  out: RADIO-off loop iterations per interval (0 == still
+ *                    continuous / not yet converged).
+ * @param rxon_it     out: measured RX-wait loop iterations (the lead before
+ *                    the anchor once converged).
+ * @return RX-on duty as a percentage of the interval (off+on), or 100 while
+ *         continuous.  Both values are FLPR loop iterations (the core rate
+ *         is contended, so they are a ratio, not a wall-clock time).
+ */
+uint32_t tiku_flpr_arch_conn_anchor(uint32_t *gap_off_it, uint32_t *rxon_it);
+
+/**
+ * @brief Non-blocking advertise+hold (L6 F-L6.3 facade start).
+ * @return 0 shipped, -1 not running / bad args.  Poll conn_active().
+ */
+int tiku_flpr_arch_conn_start(const uint8_t *adv, uint32_t adv_len,
+                              const uint8_t *rsp, uint32_t rsp_len,
+                              const uint8_t *addr);
+
+/** @brief 1 once the central subscribed to NUS TX notifications. */
+int tiku_flpr_arch_conn_subscribed(void);
+
+/** @brief Is a received L2CAP fragment waiting? (peek, no consume). */
+int tiku_flpr_arch_conn_rx_ready(void);
+
+/**
+ * @brief Pop the L2CAP fragment the controller forwarded; count (0 if none).
+ * @param llid out (may be NULL): 2 = start of an L2CAP PDU, 1 = continuation.
+ */
+int tiku_flpr_arch_conn_recv(uint8_t *buf, uint32_t cap, uint8_t *llid);
+
+/**
+ * @brief Hand one L2CAP fragment to the controller for TX; count, or -2 if
+ *        the previous fragment is still unconsumed (retry).
+ * @param llid 2 = start of an L2CAP PDU, 1 = continuation.
+ */
+int tiku_flpr_arch_conn_send(const uint8_t *buf, uint32_t len, uint8_t llid);
+
+#endif /* TIKU_NORDIC_FLPR_ARCH_H_ */
