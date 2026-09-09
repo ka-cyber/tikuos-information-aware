@@ -1,6 +1,6 @@
 # Reproducible Information-Utility Scheduling on TikuOS
 
-A research-grade, reproducible implementation and evaluation artifact for a
+A reproducible research prototype and evaluation artifact for a
 **small, deterministic, application-agnostic utility contract at the TikuOS
 worker-scheduling boundary**.
 
@@ -159,12 +159,13 @@ are workload realizations, not independent observations within a workload.
 - explicit hint delay
 - controller cost
 
-The scientific target is not always win. It is the boundary:
+The scientific target is not "always win." It is the boundary:
 
 ```text
-utility-estimation quality x controller overhead
-                â†“
-        positive / neutral / harmful
+utility-estimation quality × controller overhead
+                    |
+                    v
+          positive / neutral / harmful
 ```
 
 A deliberately adversarial workload is retained even when the proposed policy
@@ -235,7 +236,7 @@ This repository does not claim:
 5. that CardioFusion/APC-RLNC are fully integrated into TikuOS hardware;
 6. that host-model results establish superiority on a board.
 
-The plausible systems contribution is narrower: a **tiny, bounded, generic OS
+The systems question explored here is narrower: a **tiny, bounded, generic OS
 contract for application-provided expected marginal utility**, with explicit
 correctness semantics and a measurable failure boundary.
 
